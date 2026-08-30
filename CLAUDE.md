@@ -13,9 +13,9 @@ It marks every item **decided**, **recommended**, or **open**. Honour
 those labels. A recommendation is an argument I have not yet accepted.
 
 **§19 lists what changed from v1 and why.** If you have seen an older
-version of this project's design — or the draft at
-`docs/reference/protocols-draft.py` — several things were reversed.
-Check §19 before repeating an argument I have already settled.
+version of this project's design, several things were reversed — some of
+them twice. Check §19 before repeating an argument I have already
+settled.
 
 ## What foliot is
 
@@ -62,12 +62,14 @@ dependency and not a concern.
 If layer 1 cannot be used without layer 2, we have built a framework with
 a mandatory opinion. Do not let layer 2 concepts leak downward.
 
-## `docs/reference/protocols-draft.py` is superseded
+## The v1 draft is gone
 
-Kept for the vocabulary and the reasoning in its docstrings. **Do not
-copy it into `src/`.** Its `Action` shape is wrong (actions are objects
-with `process()` now, not data plus a `kind` registry), `target` is out,
-and the two-layer split changes what belongs in `protocols.py`.
+`docs/reference/protocols-draft.py` was deleted at M1. Its shape was
+wrong in every load-bearing way — data-only actions with a `kind`
+registry, `target` as a core field, `Any` where the world type belongs —
+and keeping it meant keeping a wrong shape in the tree for someone to
+copy. The two ideas worth having are in §10.5; the rest is in git
+(`git show 1d22a00:docs/reference/protocols-draft.py`).
 
 ## Open questions — ask, do not decide
 
@@ -91,14 +93,32 @@ Everything else in v1's open list is now settled. See §18 and §19.
 `uv` changes fast — check current syntax against its docs rather than
 assuming.
 
-Python 3.11+, `src/` layout, `pytest`, `ruff`, `mypy --strict` on
-`src/`. Strict typing is not optional: the design is Protocol-based, and
-Protocols without a type checker are just comments.
+Python 3.12+ floor, 3.14 dev interpreter, `src/` layout, `pytest`,
+`ruff`, `basedpyright` in strict mode on `src/`. Strict typing is not
+optional: the design is Protocol-based, and Protocols without a type
+checker are just comments. `# type: ignore` is disabled outright
+(`enableTypeIgnoreComments = false`) — a checker you can silence is a
+checker you will silence.
 
 Ship `src/foliot/py.typed` or consumers get no type information at all.
 
 `dependencies` must stay empty. Postgres support goes in an extra or a
 separate distribution.
+
+## Code conventions
+
+Two files under `docs/conventions/`, subordinate to the design doc:
+
+- **`python-style.md`** — type discipline, exhaustive `match` with no
+  catch-alls, class shape without Pydantic, public-API surface, and the
+  three foliot-specific bans (`random` outside `rng.py`, `hash()` on a
+  string, `time.time()` outside a driver).
+- **`testing.md`** — the four architectural tests, and why
+  `unittest.mock`, `pytest-mock`, `monkeypatch` and `freezegun` are
+  forbidden outright.
+
+Every rule there names the failure it prevents. A rule that cannot name
+one should be deleted rather than obeyed.
 
 ## How I like to work
 

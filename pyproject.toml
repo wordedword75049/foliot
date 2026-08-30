@@ -1,0 +1,69 @@
+[project]
+name = "foliot"
+version = "0.1.0"
+description = "A deterministic tick-driven simulation core: durable queue, absolute deadlines, per-entity randomness."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Nikita Ivanin", email = "naik.iva@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+keywords = ["simulation", "scheduler", "tick", "deterministic", "event-queue"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Games/Entertainment :: Simulation",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.10",
+    "pytest>=9.1.1",
+    "ruff>=0.16.5",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+# `target-version` is deliberately unset: ruff infers it from
+# `requires-python`, so the consumer floor polices the syntax by itself.
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "ANN", "B", "C4", "UP", "SIM", "RET", "PT", "TID", "PTH", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN"]
+"examples/**/*.py" = ["ANN", "T201"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+# The FLOOR, not the dev interpreter: 3.14 must not smuggle in 3.13+ syntax.
+pythonVersion = "3.12"
+# Add "tests" at M1 and "examples" at M7, as those trees appear: a fake that
+# drifts from its Protocol is exactly what strict checking should catch.
+include = ["src"]
+venvPath = "."
+venv = ".venv"
+# A checker you can silence is a checker you will silence.
+enableTypeIgnoreComments = false
+reportUnnecessaryTypeIgnoreComment = "error"
+reportIgnoreCommentWithoutRule = "error"
+reportImplicitOverride = "error"
+reportMissingTypeStubs = "error"
+failOnWarnings = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"

@@ -44,7 +44,7 @@ If you are a fresh session picking this up, read in this order:
 | 2 | What foliot is: the guarantees |
 | 3 | Core vs game: the line |
 | 4 | The clock |
-| 5 | The queue: deadlines, remaining, granularity |
+| 5 | The queue: deadlines, shapes, granularity |
 | 6 | Suspension and activity groups |
 | 7 | Actions: objects, protocols, `BaseAction` |
 | 8 | Persistence: the tick is the transaction |
@@ -199,8 +199,8 @@ engine never reads it, it goes in the game's payload, not in a core type.
 | `Tick` (monotonic int) | `Char`, `EventfulEnvironment`, wolves |
 | Drivers: `ManualDriver`, `RealtimeDriver` | first-order vs second-order producers |
 | Queue keyed on `due_tick`, total order via `seq` | environments being entities at all |
-| `ActionState`: active / suspended / done / cancelled, carrying `remaining` | encounter rolls, and what `p` depends on |
-| Opaque `group_id` for suspending a *set* of actions | what an "activity" means; which suspend which |
+| `ActionState`: `Active` (`due_tick`, or none if recurring) or `Suspended` (`suspended_at`, `suspended_by`) | encounter rolls, and what `p` depends on |
+| `suspendable` — one bit: does this action stop when its owner is interrupted | which actions are suspendable, and what interrupts them |
 | `Action` protocol + `BaseAction` bookkeeping | HP, mana, `entity_state`, damage |
 | Counter-based RNG on `(world_seed, entity_id, tick, seq)` | targets — who an action is aimed at |
 | `Store` protocol + in-memory implementation | narrative log text |
@@ -254,13 +254,21 @@ The advancement mechanism is an injected dependency:
 - **`ManualDriver`** — advances instantly. Tests, fast-forward, replay.
 
 ```python
-sim.run(RealtimeDriver(tick_seconds=1.0))      # production
-sim.run(ManualDriver(until_tick=10_000_000))   # tests, fast-forward
+sim.run(RealtimeDriver(tick_seconds=1.0))  # production
+sim.run(ManualDriver(until_tick=10_000_000))  # tests, fast-forward
 ```
 
 Same code path, different sense of time. This single split is what lets
 ten million ticks run in a unit test. Hardcoding `time.sleep` into the
 loop makes the library untestable, and that is felt immediately.
+
+**The division of labour: `process_tick()` never waits.** It does one
+tick's work and returns. Deciding *when* the next call happens belongs
+entirely to the driver — immediately for `ManualDriver`, at
+`start + n * tick_duration` for `RealtimeDriver` (§4.1, absolute targets,
+never "sleep the rest of the second"). If waiting lives inside the work,
+the two drivers stop being interchangeable and a test cannot outrun the
+clock, which is the one thing this split exists to allow.
 
 ### 4.3 Catch-up policy — **OPEN**
 
@@ -292,7 +300,7 @@ fast-forwarding. That falls out of §8 for free.
 
 ---
 
-## 5. The queue: deadlines, remaining, granularity
+## 5. The queue: deadlines, shapes, granularity
 
 ### 5.1 `due_tick` is the queue primitive — **DECIDED**
 
@@ -305,8 +313,9 @@ policy*, not a storage format, and the two were separated:
 
 - **`due_tick` is the primitive.** A per-tick action is simply one whose
   handler always reschedules at `now + 1`.
-- **`ticks_remaining` rides along as a field** (§5.3), because it is
-  genuinely useful — especially for suspension.
+- **A duration is never stored as a countdown.** What survives of that
+  proposal is §5.7's *recurring* shape — "runs every tick" as a property
+  of the action, rather than a number decremented into the queue.
 
 **Why this asymmetry matters.** With `due_tick` as the primitive, per-tick
 behaviour costs nothing (`due_tick = now + 1`). With `ticks_remaining` as
@@ -334,29 +343,56 @@ class Poison(BaseAction):
         self.interval = interval
         self.expires_at = expires_at
 
-    def process(self, sim, tick):
-        sim.emit(Damage(self.entity_id, amount=3))
-        if tick + self.interval < self.expires_at:
-            sim.schedule(self, due_tick=tick + self.interval)
-        # else: poison wears off, simply by not rescheduling
+    def process(self, ctx: TickContext[World]) -> None:
+        ctx.emit(Damage(self.entity_id, amount=3))
+        ctx.log(f"{self.entity_id} is racked by poison")
+        if ctx.tick + self.interval < self.expires_at:
+            ctx.schedule(self, due_tick=ctx.tick + self.interval)
+        else:
+            ctx.log("the poison passes")
+        # wears off simply by not rescheduling
 ```
 
 Miss a tick with a countdown and it is silently wrong forever. Miss a
 tick with a deadline and nothing happens, because the deadline was never
 being maintained in the first place.
 
-### 5.3 `remaining` as a field on `ActionState` — **DECIDED (owner's call)**
+### 5.3 Store what changes; derive the rest — **DECIDED**
 
-`remaining` lives on the action's state object and is meaningful in both
-the active and suspended states:
+Three numbers describe a pending action — `current_tick`, its deadline,
+and how much is left — and any two give the third. Storing all three
+stores a fact that can disagree with itself.
 
-- **Active** — it ticks down alongside the deadline. Currently derived
-  and not load-bearing; kept because it is cheap and likely to find a use.
-- **Suspended** — it is the *only* record of how much is left, since the
-  deadline was dropped when the action left the queue.
+- **Active** carries `due_tick`. "How much is left" is `due_tick - now`:
+  derived on demand, never stored.
+- **Suspended** carries `suspended_at` — *when the pause began* — and the
+  `due_tick` it was waiting for, if it had one (§6.4).
 
-Resume is then `due_tick = current_tick + remaining`. No conversion, no
-need to consult when the action began.
+**The rule: suspension shifts every deadline forward by the length of the
+pause.**
+
+```
+paused_for = resumed_at - suspended_at
+due_tick   = due_tick + paused_for
+```
+
+That sentence is deliberately larger than the core, because the deadlines
+that matter most are not the core's. A walk's `arrives_at` is game
+payload the engine must never touch (§3), so the engine cannot repair it.
+It is shifted by the *same* number, handed to the action through
+`on_resume(paused_for)` (§6.4).
+
+**Worked, because the off-by-one here is silent.** Ivan starts walking at
+tick 0 with `arrives_at = 1000`. A wolf appears at 400; the fight ends at
+450. He still owes 600 ticks of walking, so he must arrive at **1050**.
+`paused_for = 450 - 400 = 50`, and `1000 + 50 = 1050`.
+
+Storing `remaining` instead was tried and reversed. `due = now +
+remaining` fixes the *core's* deadline correctly, but yields no pause
+length, so game payload cannot be shifted at all — a suspended Char
+would arrive as though the fight never happened. And a recurring action
+(§5.7) has no `due_tick`, so `remaining` never meant anything for it.
+§19.
 
 ### 5.4 Granularity: per-tick rolling is the default — **DECIDED (reverses v1)**
 
@@ -386,11 +422,27 @@ rolled per-tick through the change. No bookkeeping of "how far into the
 old roll we were" is ever required. If sampled waits are revisited, this
 is the fact that makes them safe.
 
-### 5.5 Tombstoning, not removal — **DECIDED**
+### 5.5 Removal, not tombstoning — **DECIDED (reverses the earlier call)**
 
-Invalidated actions are marked cancelled and skipped on pop, rather than
-removed. Simpler than removing from a heap, and it preserves an audit
-trail of what *would* have happened.
+A finished or invalidated action is **deleted**. There are only two
+states an action can be in — active or suspended (§6.4) — because "done"
+and "cancelled" are not states an action is *in*; they are the action
+ceasing to exist. When a Char dies, everything it owns goes, suspended
+rows included: one `DELETE ... WHERE entity_id = $1`.
+
+The earlier position kept tombstones for the audit trail. That argument
+does not survive §15's own conclusion: history lives in the journal, and
+the queue stays small and hot. A tombstone duplicates a journal entry
+inside the one table whose index must stay fast.
+
+**The one rule deletion imposes.** §8.5 lets a store hold a near-horizon
+cache, and §15 anticipates a second worker via `SKIP LOCKED`. An action
+already read into memory will still run after its row is deleted — the
+wolf you cancelled still bites. So **cancellation must be visible to
+whoever already holds the action**, not merely absent from the table.
+That is a conformance requirement of the `Store` protocol, owed by the
+in-memory store and the Postgres store alike, not an implementation
+detail.
 
 **Consequence:** an entity routinely has several pending actions at once —
 an arrival, a cooldown expiry, a hunger tick, a poison effect. The queue
@@ -405,9 +457,91 @@ pines."* That is a **denormalised display cache** of current narrative
 activity — explicitly not the scheduling source of truth. Keeping the two
 roles distinct is what stops them silently drifting apart.
 
+### 5.6 Scheduling is strictly into the future — **DECIDED**
+
+An action schedules its own next action, and the engine **rejects**
+`due_tick <= current_tick`. The earliest legal target is `now + 1`.
+
+**Why this is a rule and not a convention.** The engine takes the due
+list for a tick once, then runs it. If an action running at tick 5 adds
+another action to tick 5, that action lands in a bucket already read, and
+whether anything else in the tick observes it depends on who ran first:
+
+```
+step 1   ask the store what is due at tick 5   -> [Hunger, Poison]
+step 2   run Hunger   -> schedules Starve at tick 5
+step 3   run Poison   -> does Poison see Starve?
+```
+
+Run Hunger first and Poison sees it; run Poison first and it does not.
+Same tick, same starting state, different outcome by processing order —
+guarantee 2 (§2) lost through a different door than §9.2's global RNG.
+
+Forbidding same-tick scheduling closes it by construction: nothing done
+during a tick is observable within that tick, so the tick's actions can
+be shuffled, sharded or retried freely.
+
+The rule costs nothing, because the game already works this way. An
+effect belongs to the interval it covers, not the instant it fires:
+damage landing at tick 6 *is* the hunger from tick 5 to tick 6.
+
+### 5.7 Two shapes: scheduled and recurring — **DECIDED**
+
+`due_tick` is the primitive for anything that waits. It is *noise* for
+anything that acts every tick, and the difference is worth a field.
+
+- **Scheduled** — carries a `due_tick`, sleeps in the queue until it
+  arrives, wakes once. Sleeping till dawn, cooldowns, an arrival with
+  nothing to check on the way.
+- **Recurring** — runs every tick until it stops. Carries no `due_tick`,
+  because there is nothing to record: for a per-tick action the next due
+  tick is always `now + 1`, and rewriting a row every tick to say `now +
+  1` spends a delete and an insert to store a constant.
+
+**The game's mapping** (recorded, not required): an action against a
+*stale* environment — Night, weather — can produce nothing on the way, so
+it is scheduled. An action against an *eventful* environment — a forest,
+a city — gives that environment a chance to react on every step, so it is
+recurring (§11.2).
+
+**Measured**, 10,000 Chars acting every tick against Postgres 16, one
+tick per transaction:
+
+| | ms/tick | dead tuples after 20 ticks |
+|---|---|---|
+| rewrite `due_tick` every tick | 158.5 | 170,000 |
+| recurring, no queue writes | 43.1 | **0** |
+
+The 3.7x on time is the small part. The dead-tuple column is the
+autovacuum pressure §5.1 warned about, present or absent: at one tick per
+second the first row is ~1.7 billion row versions a day, the second is
+zero. **A Char walking quietly through the pines for 400 ticks touches
+the queue zero times** — one write when the walk starts, one when it
+ends.
+
+**`recurring` is a core field** by §3's test: the engine reads it to
+decide what runs. **The `Store` protocol does not change** — `due(tick)`
+still means "everything that should run now", and the store internally
+unions the rows due at `tick` with its recurring set.
+
+**There is nothing to checkpoint, and that is the point.** On a quiet
+tick a recurring walk has no mutable state anywhere: progress is
+`arrives_at - now` (derived), the RNG is counter-based with no cursor
+(§9.1), and anything that actually happened is an effect that committed
+in that tick. So the temptation to "save the active set every 30 ticks"
+has nothing to save — and taking it would resurrect §8.2's incoherence in
+miniature: a wolf's damage commits at tick 5000, the process dies at
+5020, and the queue rewinds to 4990 while the damage does not.
+
+**Cache is not checkpoint.** Memory may hold a *copy* of committed rows —
+discard it on restart, rebuild from the store, lose nothing. That is the
+near-horizon cache §8.5 already permits, and it is where the recurring
+set belongs in a Postgres store (M9). Memory must never hold state the
+store does not have.
+
 ---
 
-## 6. Suspension and activity groups — **DECIDED**
+## 6. Suspension — **DECIDED**
 
 ### 6.1 The problem
 
@@ -420,49 +554,131 @@ during the fight, and so should hunger.
 So `suspend(action_id)` is too narrow and `suspend_all_for(entity)` is
 too broad.
 
-### 6.2 The rule
+### 6.2 The rule — **DECIDED (reverses the `group_id` design)**
 
-- **Effects** — poison, hunger, cooldowns — belong to no group and keep
-  firing through any suspension.
-- **Activities** — walking, crafting, travelling — are bundles of actions
-  sharing an opaque **`group_id`**, minted when the activity starts.
-  Suspension operates on the bundle.
+Every action carries one bit:
 
-The engine never interprets `group_id`. It is a string it can group by,
-nothing more. *Which* activities suspend under *which* circumstances is
-game policy and lives entirely in game code.
+- **`suspendable = False`** — effects. Poison, hunger, cooldowns. They
+  keep firing through any suspension.
+- **`suspendable = True`** — activities. Walking, crafting, travelling.
+  They stop when their owner is interrupted.
+
+"Suspend Ivan" therefore means *suspend every suspendable action Ivan
+owns, tagged with the id of the event that interrupted him*, and resume
+means *re-enqueue everything tagged with that event*. The waking handle
+is `suspended_by` on the suspended state (§6.4) — not a group minted in
+advance by the game.
+
+**Why the bundle went away.** §6.1's motivation was that a walk is
+several pending actions — an arrival *and* an encounter roll — so
+suspension needed a handle on the set. §10.3 has since dissolved that:
+the environment's roll happens **inside the walking Char's own
+`process()`**, not as a separate queued action. A walk is one action. The
+group existed to solve a problem that another decision had already
+removed.
+
+**The constraint this accepts:** a Char has **one suspendable action at a
+time**. Walking *and* crafting at once, with only the walk suspending, is
+not expressible. That is the game's model, and it is what buys a boolean
+instead of an opaque string threaded through every activity in game code.
+
+The engine never interprets `suspended_by` beyond grouping by it. *Which*
+actions are suspendable, and what interrupts them, is game policy.
+
+**One suspender, guaranteed by shape.** Suspending an already-suspended
+action is a no-op — re-deriving `remaining` from a second suspension would
+silently lose the ticks between them. That is only safe because a Char can
+have at most one suspender, which follows from the game invariant that
+**events do not nest** (§11.6). The engine cannot enforce it; it relies on
+it, so it is written down.
 
 ### 6.3 Consequence for action granularity
 
-v1 listed "is one action one narrative beat?" as an open question. It is
-effectively answered by the above: **an activity is the narrative beat;
-the actions inside it are machinery.** The observer reads "Ivan wanders
-through the pines" — one activity. The engine sees an arrival action and
-an encounter-roll action — two actions, one `group_id`.
+"Is one action one narrative beat?" is answered, and more simply than
+before: **a suspendable action is the narrative beat.** The observer
+reads "Ivan wanders through the pines"; the engine holds one walk action,
+which rolls for encounters inside its own `process()` (§10.3). There is
+no bundle underneath, because there is nothing left to bundle.
 
-### 6.4 `BaseAction` carries the bookkeeping
+### 6.4 State classes, and `BaseAction` carries the bookkeeping — **DECIDED**
 
-Every action that inherits `BaseAction` gets suspend/resume for free. The
-game developer never writes it, and therefore cannot get `remaining`
-wrong on suspend — which is exactly the class of silent bug this design
-exists to prevent.
+`ActionState` is a discriminated union, not an enum. Each state carries
+exactly the fields that state has, so the fields cannot be wrong:
+
+```python
+@dataclass(frozen=True, slots=True)
+class Active:
+    due_tick: Tick
+    status: Literal["ACTIVE"] = "ACTIVE"
+
+
+@dataclass(frozen=True, slots=True)
+class Suspended:
+    suspended_at: Tick  # when the pause began; §5.3
+    suspended_by: SuspensionId
+    due_tick: Tick | None  # what it was waiting for, if anything
+    status: Literal["SUSPENDED"] = "SUSPENDED"
+
+
+type ActionState = Active | Suspended
+```
+
+`due_tick` is `None` exactly when the action is recurring (§5.7).
+**Open detail for M2:** whether that nullable should instead be two more
+state classes, keeping the "no illegal states" discipline absolute. Four
+classes for two bits may be more machinery than the bug it prevents.
+
+Three things this makes *impossible* rather than merely discouraged:
+
+- A suspended action with no `remaining` — the exact silent bug this
+  section exists to prevent — does not type-check.
+- An active action with no deadline does not type-check. That retires the
+  bug in the earlier sketch, which read a `self.due_tick` that `__init__`
+  never set.
+- A suspended action holds no `due_tick` to go stale, because the object
+  that held it was replaced rather than edited.
+
+`status` is a `Literal` rather than an enum member so the value in Python
+*is* the value in the `status` column (§15) and on any wire — no mapping
+layer. Exhaustive `match` over the union is checked by basedpyright, and
+catch-all `case _` branches are banned precisely because they disable
+that check (`docs/conventions/python-style.md`, §12.4).
+
+`BaseAction` owns the two transitions, so a game developer never writes
+them:
 
 ```python
 class BaseAction:
-    def __init__(self, entity_id, remaining=None, group_id=None):
+    def __init__(self, entity_id: EntityId, due_tick: Tick, *, suspendable: bool) -> None:
         self.entity_id = entity_id
-        self.remaining = remaining
-        self.group_id = group_id
-        self.state = ActionState.ACTIVE
+        self.suspendable = suspendable
+        self.state: ActionState = Active(due_tick=due_tick)
 
-    def suspend(self, tick):
-        self.remaining = self.due_tick - tick
-        self.state = ActionState.SUSPENDED
+    def suspend(self, tick: Tick, by: SuspensionId) -> None:
+        match self.state:
+            case Active(due_tick=due):
+                self.state = Suspended(suspended_at=tick, suspended_by=by, due_tick=due)
+            case Suspended():
+                pass  # already asleep; suspending twice is a no-op
 
-    def resume(self, tick):
-        self.due_tick = tick + self.remaining
-        self.state = ActionState.ACTIVE
+    def resume(self, tick: Tick) -> None:
+        match self.state:
+            case Suspended(suspended_at=at, due_tick=due):
+                paused_for = tick - at
+                self.state = Active(due_tick=None if due is None else due + paused_for)
+                self.on_resume(paused_for)  # game shifts its own deadlines
+            case Active():
+                pass
+
+    def on_resume(self, paused_for: int) -> None:
+        """Override to shift game-owned deadlines (`arrives_at`, ...) by the pause."""
 ```
+
+**Why `on_resume` exists.** The engine can shift its own `due_tick`, but a
+walk's `arrives_at` is payload it must not read (§3). Handing the game the
+pause length is the only way both sides can shift by the same number —
+and forgetting to shift is silent: Ivan simply arrives as though the
+fight never happened.
 
 ---
 
@@ -483,21 +699,23 @@ is the **store's** problem, not the action's (§7.3).
 Two mechanisms, used for different jobs:
 
 ```python
-class Action(Protocol):        # the contract the engine requires
+class Action(Protocol):  # the contract the engine requires
     def process(self, sim, tick) -> None: ...
 
-class BaseAction:              # optional convenience; satisfies the contract
-    """Handles remaining / state / group_id so you don't have to."""
+
+class BaseAction:  # optional convenience; satisfies the contract
+    """Handles the state transitions and `suspendable` so you don't have to."""
 ```
 
 For most of foliot — `Store`, `Driver`, `Rng` — a **Protocol** is right:
 pure contracts with no state of their own, so structural typing keeps the
 game from importing the library merely to satisfy a type, while
-`mypy --strict` still catches a missing or wrong-signatured method at the
+basedpyright still catches a missing or wrong-signatured method at the
 point of use.
 
 `Action` is the exception, because it carries bookkeeping the *engine*
-owns: `remaining`, active/suspended state, `group_id`, `due_tick`, `seq`.
+owns: the active/suspended state with its `due_tick` or `remaining`,
+`suspendable`, and `seq`.
 A bare Protocol would force every game to reimplement that correctly.
 
 The engine only ever type-checks against the **Protocol**, so it never
@@ -537,6 +755,7 @@ a dictionary lookup:
 ```python
 REGISTRY = {"walk": Walk, "poison": Poison}
 
+
 def decode(kind, payload):
     return REGISTRY[kind](**payload)
 ```
@@ -552,27 +771,84 @@ That dictionary is the whole of "the registry."
   library states the contract without implementing it:
 
 ```python
-def encode(action) -> tuple[str, dict]: ...   # object -> (kind, payload)
-def decode(kind, payload) -> Action: ...      # (kind, payload) -> object
+def encode(action) -> tuple[str, dict]: ...  # object -> (kind, payload)
+def decode(kind, payload) -> Action: ...  # (kind, payload) -> object
 ```
 
 The Postgres store asks for that pair; the memory store does not. So
 `kind` is part of the *storage* design, appearing only when a durable
 store is plugged in — not a tax the core charges everyone.
 
-### 7.4 Handler contract conventions — **DECIDED**
+### 7.4 The handler contract: a collecting context — **DECIDED**
 
-Two conventions carry most of the testability:
+A handler is one method, and it returns nothing:
 
-- Handlers **return or emit** scheduling requests rather than reaching
-  into the queue directly.
-- Handlers get randomness from **`ctx.rng` / `sim.rng`**, never from the
-  `random` module.
+```python
+def process(self, ctx: TickContext[W]) -> None: ...
+```
 
-Together these make a handler a plain function callable in a test with a
-fake context and asserted on by return value, rather than something
-observable only by running the world. If a handler cannot be tested that
-way, the contract has been violated somewhere.
+It *does* things — `ctx.emit(...)`, `ctx.schedule(...)`, `ctx.finish()` —
+but **nothing it says takes effect when it says it.** `TickContext`
+collects.
+
+- Two things to read: `ctx.tick`, and `ctx.rng` — already bound to
+  `(world_seed, entity_id, tick, seq)`, so the handler seeds nothing and
+  never imports `random` (§9.2).
+- Four things to say: `emit` an effect, `schedule` an action
+  (`due_tick=None` makes it recurring, §5.7), `log` a line of narrative,
+  `finish` to leave the queue.
+- `ctx.finish()` exists because a recurring action has no deadline to
+  decline. A scheduled one stops by not rescheduling.
+
+**Why not return an `Outcome`?** Returning a value was the first design,
+and it is equivalent in every guarantee. The imperative spelling was
+preferred because it reads the way the owner thinks about the game — the
+action does its own thing and queues its own successor — and the
+guarantees survive intact as long as the context collects rather than
+writes. `Outcome` remains layer 2's vocabulary (§10.4), where a resolver
+genuinely does return one.
+
+**The engine gives each action a fresh context, and drains after the
+whole loop, not during it.**
+
+- The handler returns normally → its collected work joins the tick's pile.
+- The handler **raises** → its context is discarded whole. Nothing it said
+  happens — not the effect it emitted before the exception, not the
+  successor it queued — and the engine skips it and carries on rather than
+  aborting a tick because one action has a bug.
+Every due action is asked what it wants; only then is anything written.
+Three consequences, and they are the reason for the whole shape:
+
+Two consequences, and they are the reason for the whole shape:
+
+1. **Order-independence stops being a rule and becomes a property.** No
+   action can observe another's changes within a tick, because there are
+   no changes yet. Guarantee 2 (§2) is structural rather than something
+   handler authors must respect, and §5.6's ban on same-tick scheduling
+   falls out for free. A priority order would restore *determinism* while
+   destroying *order-independence* — it fixes guarantee 1 by giving up
+   guarantee 2, which is the more valuable of the two, so it is not the
+   answer.
+2. **A handler that crashes changes nothing.** Under a context that wrote
+   as it went, a handler failing on its second line would have already
+   half-mutated the world inside the transaction that commits.
+
+**Testing costs one small fake.** A recording `TickContext` is about ten
+lines in `tests/fakes.py`, written once, and a handler is then callable
+with no engine and no store — assert on what it collected
+(`docs/conventions/testing.md`).
+
+**Keep `TickContext` narrow.** It is the one object every handler touches
+and therefore the one most likely to rot into a service locator. Two
+reads and three verbs; a proposal to add `ctx.store` or `ctx.world` is the
+alarm, not the feature. The discipline that contains it: **pass the
+capability, not the context** — a handler hands `ctx.rng` downstream,
+never `ctx`, so nothing below `process()` can reach the scheduler.
+
+**Effects are game-defined and opaque to the engine.** The engine calls
+`effect.apply(...)` and knows nothing else — not `hp`, not `entity_state`,
+not `damage`. Anything else puts a game verb in the library (§3). See
+§10.4, and the open question there about what `apply` receives.
 
 ---
 
@@ -635,19 +911,55 @@ pretending otherwise.
 Small, and it names the boundary rather than the storage:
 
 ```python
-class Store(Protocol):
-    def current_tick(self) -> int: ...
-    def due(self, tick: int) -> Iterable[Action]: ...
-    def tick_transaction(self, tick: int) -> ContextManager[Txn]: ...
+class Store(Protocol):  # the cabinet: reading, and opening a tick
+    def current_tick(self) -> Tick: ...
+    def due(self, tick: Tick) -> Iterable[Action]: ...
+    def tick_transaction(self, tick: Tick) -> ContextManager[Txn]: ...
+
+
+class Txn(Protocol):  # the tray: writing, valid only inside a tick
+    def schedule(self, action: Action, due_tick: Tick) -> None: ...
+    def delete(self, action: Action) -> None: ...
+    def suspend(self, entity_id: EntityId, by: SuspensionId) -> None: ...
+    def resume(self, by: SuspensionId) -> None: ...
 ```
 
-The engine runs each tick inside `tick_transaction` and routes everything
-it changes through the handle it gets back. The engine never calls
-"save" — it does its work inside a boundary the store defines. For the
-in-memory store that context manager does nothing; for Postgres it is
-`BEGIN` / `COMMIT`. That is precisely why the interface asks for a
-context manager rather than a `save()` method: `BEGIN`/`COMMIT` is a shape
-a dictionary can ignore for free.
+**Two objects, because reading is always legal and writing is not.** The
+only way to obtain a `Txn` is to be inside a tick, so there is no
+`store.schedule(...)` anyone *could* call at the wrong moment. The rule
+stops being something to remember and becomes something unsayable.
+
+**Nothing on the `Txn` is a game verb.** No `damage`, no `hp`. Game state
+changes travel as `Effect` objects the engine only knows how to `apply`
+(§7.4, §10.4). A `txn.damage(...)` method would put the game inside the
+library, which is §3's line.
+
+**The clock advance is implicit, and that is deliberate.** There is no
+`advance_to`. `tick_transaction(5)` already knows it is tick 5, so a
+clean exit records tick 5 as finished and `current_tick()` then returns
+6 — in the same commit as the work. §8.3 says the world and the clock
+move together; making them one operation means no store *can* implement
+it otherwise.
+
+The engine never calls "save". It does its work inside a boundary the
+store defines. For the in-memory store the context manager does nothing;
+for Postgres it is `BEGIN` / `COMMIT`. That is why the interface asks for
+a context manager rather than a `save()` method: `BEGIN`/`COMMIT` is a
+shape a dictionary can ignore for free.
+
+**`Txn` must batch.** Measured against Postgres 16 with one tick per
+transaction: 10,000 actions rescheduling themselves costs **196 ms/tick
+(20% of a 1s tick)** when writes are flushed as set-based statements, and
+**2,962 ms/tick — 296%, permanently behind** when each call issues its own
+statement. Same rows, same single commit; 15x apart. So `txn.schedule(...)`
+**collects**, and the flush at commit is one `INSERT ... SELECT unnest(...)`
+and one `DELETE ... WHERE id = ANY(...)`. The declarative handler contract
+(§7.4) hands this over for free: outcomes are already gathered before
+anything is applied, so the batch exists before the writing starts.
+
+(Sleeping actions cost nothing in the same measurement: 10,000 rows due
+far in the future never appeared in a statement, because the partial index
+skips them. That is §5.1's argument, measured.)
 
 Caching is the store's business too. The near-horizon window — pull the
 next few minutes into memory rather than querying every tick — is an
@@ -663,42 +975,54 @@ only who owns what. This ran; the output is in the comments.
 # ---------- what foliot ships ----------
 class Simulation:
     def __init__(self, store):
-        self.store = store                            # game hands it in here
+        self.store = store  # game hands it in here
 
-    def run(self, until):
-        tick = self.store.current_tick()
-        while tick < until:
-            with self.store.tick_transaction(tick):   # library opens boundary
-                for action in self.store.due(tick):
-                    action.process(self, tick)        # your object, your method
-            tick += 1
+    @property
+    def tick(self):
+        return self.store.current_tick()  # read-only: nobody sets the clock
+
+    def process_tick(self):  # never sleeps; the driver paces
+        tick = self.tick
+        with self.store.tick_transaction(tick) as txn:
+            pile = []
+            for action in self.store.due(tick):  # 1. ask everyone
+                ctx = Context(tick, rng_for(action, tick))
+                try:
+                    action.process(ctx)
+                except Exception:
+                    continue  # this context is discarded whole
+                pile.append((action, ctx))
+
+            for action, ctx in sorted(pile, key=lambda p: p[0].seq):  # 2. then apply
+                for new_action, due in ctx.schedules:
+                    txn.schedule(new_action, due)
+                for effect in ctx.effects:
+                    effect.apply(txn.world)  # game-defined; engine never looks in
+                for line in ctx.lines:
+                    txn.log(tick, line)
+                if ctx.finished:
+                    txn.delete(action)
+        # commit, and the clock advance, happened when the `with` closed
 
 
 # ---------- what the game developer writes ----------
-class Walk:
-    def __init__(self, entity_id, remaining):
-        self.entity_id, self.remaining = entity_id, remaining
-
-    def process(self, sim, tick):
-        self.remaining -= 1
-        if self.remaining > 0:
-            sim.store.schedule(self, due_tick=tick + 1)
-        else:
-            print(f"tick {tick}: {self.entity_id} ARRIVES")
+class Walk(BaseAction):  # recurring: runs every tick
+    def process(self, ctx):
+        if ctx.tick >= self.arrives_at:  # arrives_at is game payload
+            ctx.log(f"{self.entity_id} ARRIVES")
+            ctx.finish()
 
 
-class MyStore:
-    def __init__(self):
-        self.queue, self.tick = {}, 0
-    def current_tick(self):  return self.tick
-    def due(self, tick):     return self.queue.pop(tick, [])
-    def schedule(self, action, due_tick):
-        self.queue.setdefault(due_tick, []).append(action)
-    def tick_transaction(self, tick):
-        ...  # no-op in memory; BEGIN/COMMIT against Postgres
+class Damage:  # an Effect. foliot never reads it.
+    def __init__(self, entity_id, amount):
+        self.entity_id, self.amount = entity_id, amount
+
+    def apply(self, world):
+        world.entity_state(self.entity_id).hp -= self.amount
 
 
-Simulation(store=MyStore()).run(until=3)
+class MyStore:  # three methods + a Txn
+    ...
 ```
 
 | foliot | the game |
@@ -812,6 +1136,31 @@ mysterious bug rather than a configuration problem.
 Use a stable hash — `blake2b`, or pure integer mixing on integer ids.
 Cheap to get right, nasty to diagnose later.
 
+### 9.4b `seq` must never come from processing order — **DECIDED**
+
+`seq` is the action's stable identity within a tick, assigned by the store
+when the action is queued (§15's column). It is **not** its position in
+the due list, and the distinction is not cosmetic.
+
+Written positionally, two of one entity's actions rolling in the same tick
+simply swap results when the tick is shuffled:
+
+```
+seq from position:  ['walk','forage'] -> walk=0.7675  forage=0.3195
+                    ['forage','walk'] -> walk=0.3195  forage=0.7675
+seq as a stable id: ['forage','walk'] -> walk=0.7675  forage=0.3195
+```
+
+So a positional `seq` breaks guarantee 1 *and* guarantee 2 at once, and it
+does so silently — every individual run is self-consistent. Found by
+writing the first worked example, which is what §14's order-independence
+test exists to catch.
+
+The same identity fixes the order the journal is written in: a tick may be
+**processed** in any order, but its story is **told** in `seq` order.
+Otherwise two runs of the same seed produce the same world and different
+logs — verified, and in a ZPG the log is the product.
+
 ### 9.5 Deterministic ids for spawned entities — **DECIDED**
 
 Ephemeral entities (a wolf, §11.2) still need an identity while they
@@ -855,7 +1204,7 @@ queue.due(tick)                -> [Action]
   for each action: decide()    -> [Intent]     (reads frozen state)
   group intents by event_key   -> [Event]
   for each event: resolve()    -> Outcome      (the only writer)
-  apply effects, enqueue schedules, tombstone cancels
+  apply effects, enqueue schedules, delete cancels
 ```
 
 The decide phase never mutates. The resolve phase never reads anything it
@@ -906,8 +1255,15 @@ Carried forward from v1, which got this part right:
   together as one unit.
 - **`Outcome`** — everything a resolver produces: `effects`, `schedules`,
   `cancels`, `log`. Purely descriptive; no side effects.
-- **`Effect`** — a game-defined mutation object with `apply(world)`.
-  Effects are the only thing permitted to write.
+- **`Effect`** — a game-defined mutation object with `apply(txn)`. The
+  only thing permitted to write game state. **The engine calls `apply`
+  and knows nothing else** — not `hp`, not `entity_state`, not `amount`.
+  Anything richer in the signature puts a game noun in the library (§3).
+  It receives the tick's `Txn` so that its write lands in the same
+  transaction as the queue *by construction*, which turns §8.4's
+  atomicity caveat from a warning the game must honour into a property of
+  the shape. The game reaches its own world through its own `Txn`
+  implementation; foliot's `Txn` protocol never mentions one.
 - **`World`** — read access, required to present a *stable* view for the
   duration of a tick's decide phase. How (snapshot, copy-on-write, MVCC
   transaction) is the implementation's problem.
@@ -923,6 +1279,29 @@ explicit rather than incidental.
 **`log` as a first-class `Outcome` field** rather than derived from
 effects. In a ZPG the log *is* the product, so observer-facing narrative
 deserves its own channel rather than being scraped out of mutations.
+
+### 10.5 Two mechanisms rescued from the v1 draft — **RECORDED for M8**
+
+`docs/reference/protocols-draft.py` was deleted at M1 (§19). Everything in
+it was superseded except these two, which are not written down anywhere
+else and are worth having when layer 2 is built.
+
+**A solo intent needs no special case.** An intent with no `event_key`
+derives a unique one — `solo:{event_kind}:{actor_id}:{kind}` — which makes
+it a one-participant event. The engine then has exactly one code path:
+group intents by key, resolve each group. There is no branch for "only one
+participant", and therefore no branch that can be wrong. Worth keeping
+because the obvious implementation special-cases the common case and then
+diverges from it.
+
+**An intent should remember the action that produced it.** The draft
+carried `source_action_id` so a resolver could cancel the losing branch:
+the encounter fired this tick, so the arrival that would otherwise have
+happened is cancelled. The need survives even though the mechanism has
+moved on — cancellation is now deletion rather than tombstoning (§5.5),
+and layer 1 hands the engine the action object rather than an id — but a
+resolver still has to be able to say "and that other thing is not going to
+happen now."
 
 ---
 
@@ -998,6 +1377,40 @@ enforcing that the sword exists in exactly one place. If items ever have
 identity (durability, provenance), they want their own table with a
 nullable owner (`NULL` = on the ground). Recorded only so the constraint
 is known when it eventually matters. **Not core-library work.**
+### 11.6 Events do not nest — **GAME INVARIANT**
+
+An event cannot arise from inside an event. An action running as part of an
+event does no encounter rolls of its own, so nothing an event contains can
+open another one.
+
+**Why the library cares.** It is the reason a Char is inside at most one
+event at a time, therefore has at most one suspender, therefore can treat a
+second `suspend()` as a no-op without losing time (§6.2). The core cannot
+check this — it never sees an event in layer 1 — so it is recorded here as
+a requirement the game owes the engine.
+
+### 11.7 Goals: the long-running process
+
+A **goal** is a multi-stage process — go to another town, then do something
+there — held on the Char's `entity_state`, as a list of stages plus a
+progress counter. It belongs to the Char because the Char is the only
+first-order action producer (§11.2).
+
+The game urges the Char forward with it: **when a Char has no scheduled
+action, take the current goal stage and derive the next action from it.**
+That is what makes a stuck Char impossible without the core needing a
+watchdog — a lost wake-up shows up as an idle Char, and idle Chars get work.
+Mid-event Chars are not idle, because an event puts a per-tick action on
+each participant (§11.4).
+
+**None of this is core**, and it is worth being explicit about why, since
+it is the closest a game concept has come to the line. Goals are read by
+nobody in the engine, so by the §3 test they are payload. The one thing
+the game needs in order to run them — *"does this entity have any
+scheduled actions?"* — is a question it asks **its own store
+implementation**, not something the `Store` protocol must require of
+everyone. The shipped in-memory store may offer it as a convenience for
+`examples/` and tests; the protocol stays at three methods (§8.5).
 
 ---
 
@@ -1013,19 +1426,22 @@ foliot/
 ├── CLAUDE.md
 ├── docs/
 │   ├── DESIGN_SNAPSHOT.md      <- this document
-│   └── reference/
-│       └── protocols-draft.py  # v1 reference only; never imported
+│   └── conventions/
+│       ├── python-style.md
+│       └── testing.md
 ├── src/
 │   └── foliot/
 │       ├── __init__.py         # curated public API surface
 │       ├── py.typed            # required; uv init --lib creates it
-│       ├── protocols.py        # Action, Store, Driver, Rng
-│       ├── actions.py          # BaseAction, ActionState
-│       ├── rng.py              # counter-based streams
+│       ├── ids.py              # Tick, EntityId, SuspensionId
+│       ├── rng.py              # Rng + counter-based streams
+│       ├── effects.py          # Effect
+│       ├── context.py          # TickContext
+│       ├── actions.py          # Action, BaseAction, ActionState
 │       ├── engine.py           # Simulation: the tick loop
-│       ├── drivers.py          # ManualDriver, RealtimeDriver
+│       ├── drivers.py          # Driver, ManualDriver, RealtimeDriver
 │       ├── stores/
-│       │   ├── __init__.py     # Store protocol
+│       │   ├── __init__.py     # Store, Txn
 │       │   └── memory.py       # in-memory reference implementation
 │       └── events/             # LAYER 2 — optional, added after layer 1
 ├── examples/
@@ -1033,6 +1449,12 @@ foliot/
 └── tests/
 ```
 
+- **One module per concept, protocol beside its implementation.** A single
+  `protocols.py` was the earlier plan and was dropped at M1: in a library
+  whose product *is* its protocols, collecting them all in one file
+  separates each contract from the reasoning that produced it, and
+  `rng.py` opening with the Ivan/Petra coupling is worth more than a
+  tidy list of signatures. Each module's docstring carries the *why*.
 - **`src/` layout**, not flat. Prevents accidentally importing from the
   working directory instead of the installed package — a classic source
   of "works on my machine" test results.
@@ -1050,16 +1472,16 @@ foliot/
 moves fast — verify syntax against its docs rather than trusting this
 paragraph.
 
-Python 3.11+, `pytest`, `ruff`, `mypy --strict` on `src/`. Strict typing
-is not optional: the design is Protocol-based, and Protocols without a
-type checker are just comments.
+Python 3.12+, `pytest`, `ruff`, `basedpyright` in strict mode on `src/`.
+Strict typing is not optional: the design is Protocol-based, and
+Protocols without a type checker are just comments.
 
 **Verified during this session** (uv 0.8.17; current is 0.12.x, and
 nothing relevant changed):
 
 ```
-uv init --lib
-uv add --dev pytest ruff mypy
+uv init --lib --python 3.14
+uv add --dev pytest ruff basedpyright
 ```
 
 `uv init --lib` in a non-empty git repo leaves `README.md`, `LICENSE`,
@@ -1074,10 +1496,14 @@ src/foliot/py.typed        (empty, required, free)
 
 Two things to check in the generated `pyproject.toml`:
 
-- **`requires-python`** is set from whichever Python uv found. On a 3.13
-  machine it writes `>=3.13`, which would lock out 3.11 and 3.12 users.
-  We want `>=3.11`.
+- **`requires-python`** is set from whichever Python uv found, i.e. the
+  *dev* interpreter — but this field is the floor imposed on
+  **consumers**, and the two are unrelated. Developing on 3.14 is right;
+  demanding 3.14 of consumers is not. We want `>=3.12` (§12.4).
 - **`authors`** is guessed from git config.
+- **`description`** is the stub `"Add your description here"`, and it
+  ships to PyPI.
+- **`license`** is absent although `LICENSE` exists.
 
 `uv add --dev` puts tools in a dependency group, **not** in
 `dependencies`, so `dependencies = []` stays empty. Someone doing
@@ -1103,6 +1529,60 @@ folder:
   interfaces**. The in-memory implementations that ship exist primarily
   so tests and quickstarts work without a database.
 
+### 12.4 The toolchain as built — **DECIDED (M0, verified)**
+
+Not a plan; what is on disk and what was demonstrated rather than assumed.
+
+```
+uv init --lib --python 3.14
+uv add --dev pytest ruff basedpyright
+```
+
+Pinned at M0: uv 0.12.x, basedpyright 1.39.10 (pyright 1.1.412), ruff
+0.16.5, pytest 9.1.1. `.python-version` is `3.14`; `requires-python` is
+`>=3.12`. **These are different knobs and it is worth restating why:**
+`.python-version` is the interpreter this project is developed on;
+`requires-python` is the floor imposed on consumers. Confusing them is
+the mistake §12.2 warns about, in whichever direction.
+
+Three things were verified by running them, not by reading docs:
+
+1. **`# type: ignore` is inert.** With `enableTypeIgnoreComments = false`,
+   a deliberately wrong return still errors on the line carrying the
+   comment. `reportUnnecessaryTypeIgnoreComment` catches the leftovers.
+2. **The floor polices itself.** `class Later[A = int]` (PEP 696, 3.13+)
+   fails on a 3.14 dev machine under both tools — basedpyright *"Type
+   variable default types require Python 3.13 or newer"*, ruff *"Cannot
+   set default type for a type parameter on Python 3.12"*. Ruff infers
+   this from `requires-python`, so `target-version` is deliberately
+   **unset**: setting it would let the two drift apart.
+3. **`match` exhaustiveness bites, and `case _` disables it.** Four
+   `ActionState` members with two handled reports *"Unhandled type:
+   `Literal[ActionState.DONE, ActionState.CANCELLED]`"*. Adding
+   `case _: raise AssertionError(...)` — a branch that looks defensive —
+   reduces that to **zero errors**. Hence the ban on catch-alls
+   (`docs/conventions/python-style.md`). This is what makes adding an
+   `ActionState` member a compile error at every call site instead of a
+   silent fallthrough at tick four million.
+
+`basedpyright.include` is `["src"]` today; `tests` joins it at M1 and
+`examples` at M7, because a fake that drifts from its Protocol is exactly
+what strict checking should catch (`docs/conventions/testing.md`).
+
+Metadata fixed at M0, all of it library-specific and all of it shipped to
+consumers: `description` (was the uv stub), `license = "MIT"` with
+`license-files` (PEP 639 — `uv build` produces sdist and wheel
+successfully), `keywords`, and `classifiers` including **`Typing ::
+Typed`**, which is how an installer learns `py.typed` is meaningful.
+
+`[tool.pytest.ini_options]` sets `testpaths = ["tests"]` before `tests/`
+exists; pytest 9 warns and collects nothing rather than erroring, so this
+is safe until M1.
+
+**Conventions live in `docs/conventions/`** — `python-style.md` and
+`testing.md`. They are subordinate to this document: where they
+disagree, this document wins and the convention file is what gets fixed.
+
 ---
 
 ## 13. Build order
@@ -1112,10 +1592,10 @@ Sequenced so each milestone is independently testable.
 | # | Milestone | Depends on | Notes |
 |---|---|---|---|
 | M0 | Repo scaffold, `pyproject.toml`, lint/type/test config | — | `uv init --lib`; verify toolchain on the empty package. |
-| M1 | `protocols.py` — `Action`, `Store`, `Driver`, `Rng` | §3, §7 | Written fresh. The v1 draft is reference only. |
+| M1 | **Done.** `ids`, `rng`, `effects`, `context`, `actions`, `drivers`, `stores` — the protocols, one module per concept | §3, §7 | Written fresh; the v1 draft was reference only. Verified: a game class inheriting nothing satisfies `Action[W]`, and one missing `seq` is rejected. |
 | M2 | `actions.py` — `BaseAction`, `ActionState`, suspend/resume | M1, §6 | `remaining` bookkeeping lives here so games never write it. |
 | M3 | `rng.py` — counter-based streams, stable hashing | §9 | Watch `PYTHONHASHSEED` (§9.4). |
-| M4 | `stores/memory.py` — queue semantics | M1, M2 | `due_tick` buckets, tombstoning, `seq` ordering, no-op transaction. |
+| M4 | `stores/memory.py` — queue semantics | M1, M2 | `due_tick` buckets, deletion (with cancellation visible to already-held copies, §5.5), `seq` ordering, no-op transaction. |
 | M5 | `engine.py` + `ManualDriver` | M1–M4, §8 | The tick loop and the transaction boundary. |
 | M6 | `RealtimeDriver` | §4.3 catch-up policy | Manual first — it is what makes M5 testable. |
 | M7 | `examples/tinyworld` | M5 | Written while the API can still change. |
@@ -1197,23 +1677,38 @@ CREATE TABLE scheduled_action (
     entity_id   TEXT        NOT NULL,
     kind        TEXT        NOT NULL,   -- from encode(); see §7.3
     payload     JSONB       NOT NULL DEFAULT '{}',
-    due_tick    BIGINT      NOT NULL,
-    group_id    TEXT,                   -- activity bundle; §6.2
-    status      TEXT        NOT NULL DEFAULT 'active',
-    remaining   BIGINT,                 -- meaningful when suspended; §5.3
-    seq         INTEGER     NOT NULL DEFAULT 0,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    suspendable  BOOLEAN    NOT NULL,  -- activity vs effect;      §6.2
+    recurring    BOOLEAN    NOT NULL,  -- runs every tick;         §5.7
+    status       TEXT       NOT NULL DEFAULT 'active',  -- 'active' | 'suspended'
+    due_tick     BIGINT,               -- NULL iff recurring;      §5.7
+    suspended_at BIGINT,               -- set iff suspended;       §5.3
+    suspended_by TEXT,                 -- owes the wake-up;        §6.2
+    seq          INTEGER    NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- The state union of §6.4, enforced by the database rather than by care.
+    CONSTRAINT action_state CHECK (
+           (status = 'active'    AND suspended_at IS NULL AND suspended_by IS NULL)
+        OR (status = 'suspended' AND suspended_at IS NOT NULL
+                                  AND suspended_by IS NOT NULL)
+    ),
+    CONSTRAINT action_shape CHECK (recurring = (due_tick IS NULL))
 );
+
+-- Recurring actions: read every tick, written only when one starts or ends (§5.7).
+CREATE INDEX scheduled_action_recurring
+    ON scheduled_action (entity_id)
+    WHERE status = 'active' AND recurring;
 
 -- The scheduler's hot path: everything due at or before tick N.
 CREATE INDEX scheduled_action_due
     ON scheduled_action (due_tick, seq, id)
     WHERE status = 'active';
 
--- Suspending or cancelling a whole activity at once (§6.2).
-CREATE INDEX scheduled_action_group
-    ON scheduled_action (group_id)
-    WHERE status = 'active';
+-- Waking everything one event put to sleep (§6.2).
+CREATE INDEX scheduled_action_suspended_by
+    ON scheduled_action (suspended_by)
+    WHERE status = 'suspended';
 
 -- World clock. Single row. Must survive restart (§4.4).
 CREATE TABLE world_state (
@@ -1261,15 +1756,16 @@ history in the journal, keep the queue small and hot.
 | **Tick** | One discrete step of world time. ~1 real second, configurable. Monotonic integer. |
 | **Action** | A scheduled unit of work owned by one entity, with a `process()` method. Stored in the queue. |
 | **`due_tick`** | The absolute tick at which an action becomes due. The queue's primitive. |
-| **`remaining`** | Ticks left in an action. Rides along while active; the sole record while suspended. |
-| **`group_id`** | Opaque activity bundle. Suspension operates on it. The engine never interprets it. |
-| **Activity** | A bundle of actions sharing a `group_id` — one narrative beat. Game concept. |
+| **`suspended_at`** | The tick a pause began. Resume shifts every deadline — the core's and the game's — forward by `now - suspended_at`. |
+| **Recurring** | An action that runs every tick and carries no `due_tick`, because for it the next due tick is always `now + 1`. |
+| **`suspendable`** | One bit per action: does it stop when its owner is interrupted? Effects are not; activities are. |
+| **`suspended_by`** | Id of the event that suspended an action, and therefore owes it a wake-up. |
+| **Activity** | A suspendable action — one narrative beat. Game concept. |
 | **Effect (game sense)** | Poison, hunger, cooldowns — actions belonging to no group, which tick through suspension. |
 | **Effect (layer 2)** | A mutation object with `apply(world)`. The only thing permitted to write. |
 | **Driver** | The thing that advances the clock. `RealtimeDriver` sleeps; `ManualDriver` does not. |
 | **Store** | The consumer's persistence adapter: `current_tick`, `due`, `tick_transaction`. |
 | **Tick transaction** | The atomicity boundary. Everything in tick N lands together or not at all. |
-| **Tombstone** | Marking an action cancelled rather than deleting it. |
 | **Intent** | *(Layer 2)* What an entity wants to do, before anyone knows whether it succeeds. |
 | **Event** | *(Layer 2)* A bundle of intents resolved as one unit. Persisted; has a lifetime. |
 | **Resolver** | *(Layer 2)* `(ctx, event) -> Outcome`. Decides what actually happened. |
@@ -1331,18 +1827,37 @@ useful here.
 
 - `due_tick` is the primitive; per-tick is `due_tick = now + 1` (§5.1).
 - Deadlines, not countdowns; `expires_at` in payload (§5.2).
-- `remaining` on `ActionState`, meaningful in both active and suspended
-  (§5.3).
+- `remaining` belongs to the suspended state alone; three numbers, one
+  stored per state (§5.3).
 - Per-tick rolling is the default; sampled waits are available but not
   the pattern (§5.4).
-- Tombstoning, not removal (§5.5).
+- Removal, not tombstoning; two states only, and cancellation must reach
+  whoever already holds the action (§5.5).
+- Scheduling is strictly into the future; same-tick is rejected (§5.6).
+- Two shapes: **scheduled** (`due_tick`, sleeps) and **recurring** (runs
+  every tick, no `due_tick`). Measured: 0 queue writes/tick vs ~1.7bn row
+  versions/day (§5.7).
+- Suspension shifts every deadline by the pause length; `suspended_at`,
+  not `remaining`, and `on_resume(paused_for)` lets the game shift its own
+  (§5.3, §6.4).
+- Handlers tell a collecting `TickContext` and return `None`; the engine
+  drains after the whole loop, and discards the context of any handler
+  that raised (§7.4).
+- `seq` is a stable identity from the store, never positional — it seeds
+  the RNG and orders the journal (§9.4b).
+- `Store` reads and opens; `Txn` writes and must batch; the clock advances
+  implicitly on commit (§8.5).
+- `Effect.apply(txn)` — game-defined, opaque to the engine (§10.4).
 
 **Suspension**
 
-- Ungrouped effects tick through suspension; activities suspend as a
-  bundle via opaque `group_id` (§6.2).
-- `BaseAction` owns suspend/resume so games never write it (§6.4).
-- Action granularity: the activity is the narrative beat (§6.3).
+- One `suspendable` bit: effects tick through suspension, activities
+  stop; the interrupting event's id is the waking handle (§6.2).
+- One suspendable action per Char at a time (§6.2).
+- `ActionState` is a discriminated union — `Active(due_tick)` or
+  `Suspended(remaining, suspended_by)` — not an enum (§6.4).
+- `BaseAction` owns both transitions so games never write them (§6.4).
+- Action granularity: the suspendable action is the narrative beat (§6.3).
 
 **Actions and persistence**
 
@@ -1372,8 +1887,8 @@ useful here.
 
 **Project**
 
-- Library named `foliot`; `uv` for everything; Python 3.11+;
-  `mypy --strict` on `src/`.
+- Library named `foliot`; `uv` for everything; Python 3.12+ floor with a
+  3.14 dev interpreter (§12.4); `basedpyright` strict on `src/`.
 
 ### Open, needs deciding
 
@@ -1388,8 +1903,21 @@ useful here.
 
 ### Immediate next work
 
-M0: `uv init --lib` and `uv add --dev pytest ruff mypy`, then metadata
-and tool config, then verify the toolchain on the empty package. Then M1.
+M0 and M1 are **done**: scaffold and toolchain (§12.4), then the
+protocols as one module per concept (§12.1), type-checked under
+`basedpyright` strict and conformance-checked against a throwaway game
+implementation. Next is **M2** — `BaseAction`, the `ActionState` union and
+the shift rule (§6.4) — then `tests/` with `"tests"` added to
+`basedpyright.include`.
+
+Four questions raised against this document during M0 and still to
+settle, before or alongside M1: the scheduling contract
+(`sim.schedule` vs `sim.store.schedule` vs "handlers emit", §5.2 / §7.4 /
+§8.5 / §8.6 disagree); the `ActionState` name collision (enum in §3/§6.4,
+"state object" in §5.3); where `due_tick` is written, since
+`BaseAction.suspend` reads a `self.due_tick` that `__init__` never sets
+(§6.4). A fourth — whether `docs/conventions/` should exist — was
+answered yes during M0 (§12.4).
 
 ---
 
@@ -1410,4 +1938,18 @@ Losing the reasoning is the only real cost of overwriting a document.
 | **Action granularity is open**: is one action one narrative beat? | **Effectively answered.** The *activity* is the narrative beat; the actions inside it are machinery. | Fell out of needing a bundle handle (`group_id`) for suspension. |
 | A **reaction pass** may be needed so targeted entities can act. | **Not needed.** | The environment rolls inside the walking Char's own decide, and schedules the resulting event for the next tick. The pipeline stays single-pass. |
 | Intents/events/resolvers are **the framework layer** (core, central). | **Layer 2 — a separate, optional module.** | Layer 1 must be complete and useful alone, or foliot is a framework with a mandatory opinion rather than a library. Layer 2 still earns inclusion because it adds simultaneity. |
-| `docs/reference/protocols-draft.py` is the reference shape. | **Superseded.** Vocabulary still useful; signatures are not. | `Action` changed shape entirely (§7.1), `target` is out, and the two-layer split changes what belongs in `protocols.py`. |
+| `docs/reference/protocols-draft.py` is the reference shape. | **Superseded, then deleted at M1.** | `Action` changed shape entirely (§7.1), `target` is out, and the two-layer split changed what belongs where. Keeping it cost a lint exclusion and left a wrong shape in the tree for someone to copy. Its two surviving ideas — solo-intent keys and `source_action_id` — are now in §10.5, and `git show 1d22a00:docs/reference/protocols-draft.py` has the rest. Deleting a file is not losing it; failing to extract its reasoning first would have been. |
+| **`mypy --strict`** is the type checker (§12.2). | **`basedpyright` in strict mode.** | Two behaviours mypy does not offer, both demonstrated during M0. `enableTypeIgnoreComments = false` makes `# type: ignore` stop silencing anything, so a suppression cannot be smuggled in. And `reportMatchNotExhaustive` names the unhandled member when a `match` misses a case — which is what turns adding an `ActionState` member into a compile error at every call site instead of a silent fallthrough. Corollary rule: a `case _:` branch, *even one that raises*, disables that check completely — verified, zero errors reported — so catch-alls are banned. |
+| **`requires-python = ">=3.11"`** — widest reach; PEP 695 buys foliot little because its protocols are not generic. | **`>=3.12`.** | Reversed after reading a mature in-house Python codebase whose style the owner wants to match. PEP 695 (`type Tick = int`, `class Store[A](Protocol):`) and `@typing.override` are the visible part of that style, and `override` cannot be had on 3.11 without `typing_extensions` — a dependency, which is forbidden. Cost: Debian 12's system Python (3.11) is excluded; Ubuntu 24.04 LTS (3.12) is not. The floor is enforced mechanically rather than by care — ruff infers its target from `requires-python`, so 3.13+ syntax fails to lint on a 3.14 dev machine (verified with PEP 696 defaults). |
+| **Tombstoning, not removal** — mark cancelled, skip on pop, keep the audit trail. | **Removal.** A done or cancelled action is deleted; only `active` and `suspended` exist. | The audit argument does not survive §15's own conclusion that history belongs in the journal and the queue stays small and hot — a tombstone duplicates a journal entry inside the one table whose index must stay fast. What replaces it is a conformance rule: cancellation must be visible to whoever already **holds** the action (near-horizon cache, `SKIP LOCKED` worker), since a deleted row cannot stop a copy already in RAM. |
+| **`ActionState` is four statuses** — active / suspended / done / cancelled — with `remaining` alongside. | **Two states, as a discriminated union.** `Active(due_tick)` \| `Suspended(remaining, suspended_by)`. | Done and cancelled are not states an action is *in*; they are it ceasing to exist. Per-state fields make the target bug unwritable: a suspended action without `remaining` and an active one without a deadline both fail to type-check, which also retires the `AttributeError` in the old §6.4 sketch (it read a `self.due_tick` that `__init__` never set). `status` is a `Literal`, so the Python value *is* the `status` column value. |
+| **`remaining` rides along while active too** — cheap, and likely to find a use. | **`remaining` exists only while suspended.** | Three numbers — `current`, `due`, `remaining` — any two give the third. Under state classes the convenience copy becomes a second, silently divergent record of a derived value. |
+| **Opaque `group_id`** minted when an activity starts; suspension operates on the bundle. | **One `suspendable` bit per action**, plus `suspended_by` on the suspended state. | §6.1's motivation was that a walk is several pending actions needing one handle. §10.3 had already dissolved that — the environment's roll happens inside the walking Char's own `process()`, so a walk is *one* action and there is nothing left to bundle. Accepts the constraint that a Char has one suspendable action at a time. Waking is pushed by the event that did the suspending, never polled: ordering the queue by status to let a suspended action notice its own release would make processing order significant, which is guarantee 2 gone. |
+| *(new — not a reversal)* Scheduling had no stated bound. | **Same-tick scheduling is rejected**; earliest legal target is `now + 1` (§5.6). | The engine reads a tick's due list once. An action added to the current tick lands in a bucket already read, so whether anything else observes it depends on who ran first — order-dependence through a different door than §9.2. Costs nothing: an effect belongs to the interval it covers, so damage at tick 6 *is* the hunger from 5 to 6. |
+| **Handlers "return or emit"** scheduling requests (§7.4), while §5.2 called `sim.schedule(...)`, §8.6 called `sim.store.schedule(...)`, and `sim` was never defined anywhere. | **Declarative.** `process(ctx) -> Outcome \| None`; the engine applies outcomes **after** the whole loop. `ctx` is a `TickContext` Protocol carrying `tick` and `rng`. | The "or" was the real defect — the doc never chose, and three examples drifted apart. Declarative wins on a mechanical argument, not symmetry: a handler that raises has, under the imperative style, already half-mutated the queue inside the transaction that commits. Applying after the loop also makes order-independence structural instead of a rule, and layer 2 (§10.1) is already this shape — so an imperative layer 1 would mean rewriting every handler the day layer 2 arrives. |
+| The `Store` protocol had three read-ish methods and **no way to write anything**, while §8.6 called `store.schedule(...)`. | **`Store` reads and opens; `Txn` writes.** No `advance_to` — the clock moves implicitly on a clean commit. | Writing is legal only inside a tick, so the only way to get a writer is to be inside one; the rule becomes unsayable rather than remembered. Making the clock bump part of the commit means no store *can* separate the work from the clock, which is what §8.3 asserts. `Txn` must also batch: measured, 15x between set-based flushing and one statement per call. |
+| **`due_tick` is the sole queue primitive** (§5.1); per-tick behaviour is just `due_tick = now + 1`. | **Two shapes: scheduled *or* recurring.** A recurring action carries no `due_tick`. | For a per-tick action `due_tick` is always `now + 1` — a constant. Rewriting the row every tick spends a delete and an insert to store nothing, and §5.4 made per-tick rolling the default, so this is the common case, not an edge one. Measured on Postgres 16 at 10,000 active Chars: 158.5 ms/tick and 170,000 dead tuples per 20 ticks, versus 43.1 ms and **zero**. §5.1's argument survives intact — it was always about *idle* actions, and it never covered active ones. |
+| **`Suspended` carries `remaining`**; resume is `due = now + remaining`. | **`Suspended` carries `suspended_at`**; resume shifts every deadline by `now - suspended_at`, and `on_resume(paused_for)` hands the same number to the game. | `remaining` fixes the core's deadline but yields no pause length, and a walk's `arrives_at` is game payload the engine must not touch — so under `remaining` a suspended Char arrives as though the fight never happened. A recurring action has no `due_tick`, so `remaining` never meant anything for it either. The owner proposed storing `suspended_on`; the formula offered (`arrives_at = suspended_on + remaining`) drops the pause, but the instinct behind it was right and produced the shift rule. |
+| Handlers **return an `Outcome`**, which the engine applies after the loop. | Handlers **tell a collecting `TickContext`** — `ctx.emit`, `ctx.schedule`, `ctx.finish` — and return `None`. | Equivalent in every guarantee: the context collects rather than writes, the engine still drains only after every action has been asked, and a raising handler still changes nothing because its context is discarded whole. Chosen for the spelling: it reads the way the owner thinks about the game — an action does its own thing and queues its own successor — without buying back the ordering problem that direct mutation would. `Outcome` stays layer 2's vocabulary, where a resolver really does return one. Cost: testing a handler needs a ten-line recording fake instead of asserting on a return value. |
+| *(new — found while writing the first worked example)* `seq` was unspecified; the obvious implementation is the position in the due list. | **`seq` is a stable identity assigned by the store**, never positional. | It seeds the RNG. Positionally, shuffling a tick swaps the draws of two actions owned by the same entity, breaking replay *and* order-independence together, silently. It also fixes journal order: process in any order, tell the story in `seq` order. |
+| A single `protocols.py` holds `Action`, `Store`, `Driver`, `Rng` (§12.1). | **One module per concept**, protocol beside where its implementation will live. | In a library whose product is its protocols, one file separates each contract from the reasoning that produced it. `rng.py` opening with the Ivan/Petra coupling is worth more than a tidy list of signatures. |
