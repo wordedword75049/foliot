@@ -1,188 +1,233 @@
-# foliot — Design Snapshot
+# foliot — Design Snapshot (v2)
 
-> **What this document is.** A record of a design conversation, intended as
-> handoff memory for a fresh session where actual repository work begins.
-> It captures not just conclusions but the reasoning behind them, the
-> alternatives considered and rejected, and — importantly — the questions
-> that are still genuinely open. Where something was proposed but not
-> confirmed by the project owner, that is marked explicitly. Do not treat
-> recommendations in this document as settled decisions.
+> **What this document is.** Version-controlled memory for a project that is
+> designed across sessions. It records decisions *and their reasoning*, the
+> alternatives rejected, and the questions still genuinely open.
+>
+> **v2 supersedes v1.** Several v1 recommendations were reversed in the
+> session that produced this revision. §19 lists every reversal with its
+> reason, so the old reasoning is not lost — but §19 is history, and
+> everything before it is current. Where they disagree, this document wins.
+>
+> Items are marked **DECIDED**, **RECOMMENDED** (argued but not accepted),
+> or **OPEN**. A recommendation is an argument, not a decision.
 
 ## Start here
 
 If you are a fresh session picking this up, read in this order:
 
-1. **§18 Status summary** — what is decided, what is merely recommended,
-   what is open. Sixty seconds, and it prevents the most likely failure
-   mode: treating a recommendation as a decision.
-2. **§7 The framework layer** and **§16 the protocols appendix** — the
-   actual contracts. This is the design.
-3. **§11 Build order** — what to write first.
-4. **§15 Working notes** — how the owner prefers to work. Worth reading
-   before proposing anything.
+1. **§2 What foliot is** — the guarantees. Everything else exists to hold
+   these up.
+2. **§3 Core vs game** — the line. The single most common failure mode on
+   this project is putting game concepts in the library.
+3. **§18 Status summary** — what is settled, what is open.
+4. **§13 Build order** — what to write first.
+5. **§17 Working notes** — how the owner works. Read before proposing
+   anything.
 
 **Three things that will otherwise trip you up:**
 
-- The **rendezvous problem (§8.1)** is unresolved and **blocks the
-  registry**. It determines whether `Event` is persisted or ephemeral,
-  which propagates into the schema. Settle it before writing the loop.
-- **Scope is the core library only (§6.3).** The owner explicitly
-  deprioritised game-domain modelling — items, inventory, combat rules,
-  enchantments. Do not drift into it.
-- The **per-entity RNG recommendation (§5.2)** was argued for but not
-  confirmed, and the owner's stated preference was a global RNG. Do not
-  silently implement either one; raise it.
+- **The rendezvous problem from v1 §8.1 is resolved (§10.2).** Don't
+  re-litigate it.
+- **The RNG question is resolved (§9).** Per-entity, counter-based. Don't
+  propose a global stream.
+- **Sampled/geometric waits were reversed (§5.4, §19).** The default is
+  per-tick rolling. The *ability* to schedule far into the future stays.
+
+---
 
 ## Contents
 
 | § | Section |
 |---|---|
 | 1 | Project context |
-| 2 | Fundamental simulation decisions |
-| 3 | The clock |
-| 4 | The queue |
-| 5 | Determinism and randomness |
-| 6 | Entity and state model |
-| 7 | The framework layer |
-| 8 | The open question the conversation paused on |
-| 9 | Naming |
-| 10 | Repository layout |
-| 11 | Build order |
-| 12 | Testing strategy |
-| 13 | Postgres schema sketch |
-| 14 | Glossary |
-| 15 | Working notes |
-| 16 | Appendix: `foliot/protocols.py` |
-| 17 | Library hygiene notes |
+| 2 | What foliot is: the guarantees |
+| 3 | Core vs game: the line |
+| 4 | The clock |
+| 5 | The queue: deadlines, remaining, granularity |
+| 6 | Suspension and activity groups |
+| 7 | Actions: objects, protocols, `BaseAction` |
+| 8 | Persistence: the tick is the transaction |
+| 9 | Randomness |
+| 10 | Layer 2: intents, events, resolvers |
+| 11 | The game model (recorded here, built elsewhere) |
+| 12 | Repository layout and tooling |
+| 13 | Build order |
+| 14 | Testing strategy |
+| 15 | Postgres notes |
+| 16 | Glossary |
+| 17 | Working notes |
 | 18 | Status summary |
+| 19 | Superseded: what changed from v1, and why |
 
 ---
 
 ## 1. Project context
 
-### 1.1 What is being built
+### 1.1 What is being built — **DECIDED**
 
 Two separate projects, deliberately split:
 
-1. **The core library** — a general-purpose, domain-agnostic clock /
-   queue / event-processing engine. This is the primary interest. The
-   owner has not written a library before, so library-shaped concerns
-   (packaging, public API surface, testability, no import-time side
-   effects) are part of the learning goal, not incidental.
+1. **`foliot`** — a general-purpose, domain-agnostic tick/queue engine.
+   This is the primary interest. The owner has not authored a library
+   before, so library-shaped concerns (packaging, public API surface,
+   testability, no import-time side effects) are part of the learning
+   goal, not incidental.
 
-2. **The game** — a zero-player game (ZPG) that consumes the library.
+2. **The game** — a zero-player game (ZPG) consuming the library.
    Reference points: **Godville** and **The Tale (Сказка)**. A player
    creates a character and then *observes*; the character and the world
-   live on autonomously on a server. The player is a spectator, not an
-   agent.
+   live on autonomously on a server. The player is a spectator.
 
-The library is the deliverable being designed here. The game is the
-motivating use case and the source of requirements, but the library must
-not know anything about it.
+The library is the deliverable. The game is the motivating use case and
+the source of requirements, but the library must not know it exists.
 
-### 1.2 Why the split matters architecturally
+### 1.2 Why the split matters — **DECIDED**
 
-In a ZPG the simulation **is** the entire product. There is no player
-input to hide latency behind, no interaction loop to paper over gaps in
-the world model, and no way to defer content generation to the user. The
-log of what happened is the thing players consume. This raises the
-stakes on three properties that would be minor in a conventional game:
+In a ZPG the simulation **is** the product. There is no player input to
+hide latency behind and no interaction loop to paper over gaps in the
+world model. The log of what happened is the thing players consume. Three
+properties that would be minor in a conventional game become central:
 
 - **Durability** — the world runs for months. Losing pending state is
   unrecoverable, because the history is the content.
 - **Explicability** — players will ask "why did my character die here?"
-  and the system must be able to answer. This drives the determinism and
-  replay requirements.
-- **Continuous operation** — see §2.1.
+  and the system must be able to answer.
+- **Continuous operation** — the world runs whether or not anyone is
+  watching (§1.3).
 
-### 1.3 Stack
+### 1.3 Continuous simulation, not lazy materialisation — **DECIDED**
 
-Chosen for owner familiarity and enjoyment, which is the right criterion
-for a hobby project:
+The alternative was *lazy* simulation: store `last_simulated_at` per
+character and materialise intervening events only when someone opens the
+page. Free for idle characters.
 
-- **Python**
-- **PostgreSQL**
-- **Flask or FastAPI** (undecided, and doesn't matter yet — the web layer
-  is downstream of everything in this document)
-
-The core library should have effectively **zero dependencies**. Anything
-Postgres-shaped belongs in an extras group or a separate package. This
-is what makes it a library rather than a game with a tidy folder layout.
-
-### 1.4 Non-technical context (brief)
-
-Personal, non-commercial hobby project, entirely unrelated to the
-owner's employment. Personal use of company tooling is sanctioned by
-their employer. One thing flagged and worth keeping in mind: employment
-agreements sometimes contain invention-assignment clauses covering work
-created "using company resources or systems," which can create IP
-ambiguity for side projects built through employer-provided tooling. Not
-a concern for a hobby repo, potentially relevant if the project ever
-becomes something. Not legal advice; worth a look at the actual
-agreement if it ever matters.
-
----
-
-## 2. Fundamental simulation decisions
-
-### 2.1 Continuous simulation, not lazy materialisation — **DECIDED**
-
-The alternative considered was *lazy* simulation: store `last_simulated_at`
-per character and materialise the intervening events only when someone
-opens the page. That costs nothing for idle characters.
-
-**Rejected** because it makes cross-character interaction genuinely hard.
+**Rejected** because cross-character interaction becomes genuinely hard.
 Two characters meeting, a shared economy, or world-scale events would all
 require force-materialising every participant, and the complexity
-compounds. Continuous is what Godville does, and it is the easier
-long-run bet for any shared-world or social layer — even though it burns
-cycles on behalf of nobody.
+compounds. Continuous is what Godville does and it is the easier long-run
+bet for any shared-world layer, even though it burns cycles on behalf of
+nobody.
 
-**Consequence:** the engine must run whether or not anyone is watching,
-which makes the clock a real service with real uptime concerns.
+**Consequence:** the engine is a real service with real uptime concerns.
 
-### 2.2 Tick-based, ~1 second per tick — **DECIDED (owner's design)**
+### 1.4 Tick-based, ~1 second per tick — **DECIDED**
 
-The world advances in discrete ticks of roughly one second. Tick
-duration is a configuration value, not a constant baked into logic.
+The world advances in discrete ticks of roughly one second. Tick duration
+is configuration, never a constant baked into logic.
 
-### 2.3 Load profile — **ESTABLISHED**
+### 1.5 Load profile — **ESTABLISHED**
 
-Throughput is a non-issue and should not drive design. Godville
-generates roughly one event per minute per hero. Ten thousand characters
-is under 200 events/second, which is nothing for Postgres.
+Throughput is a non-issue and should not drive design. Godville generates
+roughly one event per minute per hero. Ten thousand characters is under
+200 events/second, which is nothing for Postgres.
 
 What *does* matter is **per-character isolation**: character A's
 simulation must never affect character B's outcomes. That property is
-what permits out-of-order processing, retries, and sharding. Optimise
-for isolation and determinism, not for raw throughput.
+what permits out-of-order processing, retries, and sharding. Optimise for
+isolation and determinism, not raw throughput.
+
+### 1.6 Stack — **DECIDED**
+
+Python, PostgreSQL, and Flask-or-FastAPI (undecided and irrelevant to the
+library). The core library has **zero dependencies**. Anything
+Postgres-shaped lives in an extras group or a separate distribution.
+
+### 1.7 Non-technical context
+
+Personal, non-commercial hobby project, unrelated to the owner's
+employment. Personal use of company tooling is sanctioned by their
+employer. Flagged once and worth keeping in mind: employment agreements
+sometimes contain invention-assignment clauses covering work created
+"using company resources or systems," which can create IP ambiguity for
+side projects built through employer-provided tooling. Not a concern for
+a hobby repo; potentially relevant if this ever becomes something. Not
+legal advice.
 
 ---
 
-## 3. The clock
+## 2. What foliot is: the guarantees — **DECIDED**
 
-### 3.1 Owner's original design
+This section is the answer to "isn't a queue ticker too shallow to be a
+library?" The depth is not in the object graph. It is in the promises,
+and every promise below is something a consumer would otherwise discover
+the hard way, in production, at tick four million.
 
-An ever-running clock. Each tick:
+**foliot promises:**
 
-1. Process every action in the current tick's queue.
-2. Each action optionally produces the next action, pushed into the next
-   tick's queue.
-3. When the current queue is exhausted, sleep for
-   `tick_duration - processing_time`.
-4. Promote the next-tick queue to current. Repeat.
+1. **Same seed, same history.** Run N ticks twice from the same world
+   seed; get byte-identical output.
+2. **Reordering the queue cannot change outcomes.** Process a tick's due
+   actions in any order, on any number of workers, and the world lands in
+   the same state.
+3. **The clock does not drift.** Tick *n* happens at
+   `start + n · duration`, not `start + n · duration + nε`.
+4. **Nothing pending is lost, and nothing is applied twice.** The tick is
+   the unit of atomicity (§8).
+5. **Time is injectable.** Ten million ticks run in a unit test in under
+   a second.
 
-This is sound as a skeleton. Three refinements follow.
+Compare against what already exists — APScheduler, Celery beat, and
+friends give you "run this later." None give determinism, replay, or
+order-independence, because none of them are simulating a world. That gap
+is foliot's reason to exist.
 
-### 3.2 Absolute deadlines, not relative sleeps — **RECOMMENDED, EXPLAINED, NOT EXPLICITLY CONFIRMED**
+**The inclusion test.** For any candidate feature, ask: *does it add a
+guarantee the consumer cannot easily provide themselves?* If yes, it may
+belong in the library. If it is merely vocabulary or convenience, it
+belongs in the game. This test decided §10 (intents/events are in,
+because they add simultaneity) and §3 (targets are out, because the
+engine never reads them).
+
+**Small surface, strong promises.** That is a library. Large surface,
+vague promises, is a framework nobody can test.
+
+---
+
+## 3. Core vs game: the line — **DECIDED**
+
+**foliot is: a clock, a queue of scheduled things, a way to look up what
+to run, and a source of addressable randomness.** It knows about ticks,
+due times, statuses, ordering, and seeds. It has never heard of a target,
+a location, an environment, an activity, or combat.
+
+**The membership test for a field:** *does the engine read it?* If the
+engine never reads it, it goes in the game's payload, not in a core type.
+
+| Core (`foliot`) | Game |
+|---|---|
+| `Tick` (monotonic int) | `Char`, `EventfulEnvironment`, wolves |
+| Drivers: `ManualDriver`, `RealtimeDriver` | first-order vs second-order producers |
+| Queue keyed on `due_tick`, total order via `seq` | environments being entities at all |
+| `ActionState`: active / suspended / done / cancelled, carrying `remaining` | encounter rolls, and what `p` depends on |
+| Opaque `group_id` for suspending a *set* of actions | what an "activity" means; which suspend which |
+| `Action` protocol + `BaseAction` bookkeeping | HP, mana, `entity_state`, damage |
+| Counter-based RNG on `(world_seed, entity_id, tick, seq)` | targets — who an action is aimed at |
+| `Store` protocol + in-memory implementation | narrative log text |
+| The tick-transaction boundary | the `encode`/`decode` pair, and the database |
+| Layer 2 (optional): intents, event grouping, resolvers | what a resolver decides |
+
+**Notable exclusion — `target`.** An earlier position in this session
+argued for `target` as a first-class core field, on the grounds that it
+would drive event-key derivation and cascading cancellation. **Reversed.**
+The engine never needs to read it: in this design the environment opens
+events explicitly (§10.2), so no key derivation is required, and
+cancellation is something the game requests. `entity_id` (the owner)
+stays in core, because the queue indexes on it and the RNG seeds on it.
+
+---
+
+## 4. The clock
+
+### 4.1 Absolute deadlines, not relative sleeps — **DECIDED**
 
 `sleep(tick_duration - processing_time)` accumulates drift. Between
 waking, measuring, and sleeping again there is overhead — OS scheduler,
 instrumentation, interpreter. The real period is `1.000 + ε`, not
-`1.000`. At ε = 2 ms that is ~173 seconds lost per day; after a month
-the world clock is roughly ninety minutes behind wall time, silently.
+`1.000`. At ε = 2 ms that is ~173 seconds lost per day; after a month the
+world clock is roughly ninety minutes behind wall time, silently.
 
-Fix — target fixed wall-clock moments so errors don't compound:
+Target fixed wall-clock moments so errors do not compound:
 
 ```python
 start = time.monotonic()
@@ -194,310 +239,616 @@ while True:
 ```
 
 Use `time.monotonic()`, never `time.time()` — the latter jumps on NTP
-correction and can go backwards.
+correction and can move backwards.
 
-### 3.3 Catch-up policy — **OPEN QUESTION, MUST BE DECIDED**
+This same principle recurs in the queue (§5.2): **store deadlines, not
+countdowns.** A deadline is true whether or not anyone is awake to
+maintain it; a countdown is only correct if you were woken every single
+tick to decrement it.
 
-When `process_tick` takes longer than a tick, `max(0, ...)` returns zero
-and the system is behind. Two policies, both defensible, with different
-failure modes:
+### 4.2 Pluggable drivers — **DECIDED**
 
-| Policy | Behaviour | Failure mode |
-|---|---|---|
-| **Catch up** | Run ticks back-to-back until caught up. World time stays pinned to wall time. | Under sustained overload, the catch-up work itself causes more lag — a death spiral. |
-| **Let it lag** | World time falls permanently behind real time. Smooth, no spikes. | "5 minutes ago" in the log stops corresponding to 5 minutes ago in reality. Diverges slowly and invisibly. |
-
-A hybrid is possible: catch up, but with a bounded budget (e.g. never
-run more than N ticks back-to-back) and an alert when the lag exceeds a
-threshold. This needs deciding because it leaks into the loop structure.
-
-### 3.4 Downtime handling — **OPEN QUESTION**
-
-After four hours of downtime, what happens? Three options, all
-defensible:
-
-- **Fast-forward** — replay every missed tick. Expensive but faithful.
-- **Compress** — summarise the gap into a digest event.
-- **Shift the world clock** — declare that no in-fiction time passed.
-
-The choice affects the core's design, so it should not be deferred.
-Related requirement: **`current_tick` must be persisted**, since on
-restart the engine needs to know whether it is resuming or
-fast-forwarding.
-
-### 3.5 Pluggable drivers — **RECOMMENDED**
-
-The clock's *advancement mechanism* should be an injected dependency:
+The advancement mechanism is an injected dependency:
 
 - **`RealtimeDriver`** — sleeps to absolute deadlines. Production.
 - **`ManualDriver`** — advances instantly. Tests, fast-forward, replay.
 
-This single split is what lets ten million ticks run in a unit test in
-under a second. Hardcoding `time.sleep` into the loop makes the library
-untestable, and that is felt immediately.
+```python
+sim.run(RealtimeDriver(tick_seconds=1.0))      # production
+sim.run(ManualDriver(until_tick=10_000_000))   # tests, fast-forward
+```
+
+Same code path, different sense of time. This single split is what lets
+ten million ticks run in a unit test. Hardcoding `time.sleep` into the
+loop makes the library untestable, and that is felt immediately.
+
+### 4.3 Catch-up policy — **OPEN**
+
+When a tick takes longer than a tick, `max(0, ...)` returns zero and the
+system is behind. Two policies, both defensible:
+
+| Policy | Behaviour | Failure mode |
+|---|---|---|
+| **Catch up** | Run ticks back-to-back until caught up; world time stays pinned to wall time. | Under sustained overload the catch-up work causes more lag — a death spiral. |
+| **Let it lag** | World time falls permanently behind real time. Smooth, no spikes. | "5 minutes ago" in the log stops meaning 5 minutes ago in reality. Diverges slowly and invisibly. |
+
+A hybrid is possible: catch up with a bounded budget (never more than N
+ticks back-to-back) plus an alert when lag exceeds a threshold. This
+leaks into the loop structure, so it needs deciding before
+`RealtimeDriver` is finalised. **Not blocking M1–M4**, since `ManualDriver`
+has no such notion.
+
+### 4.4 Downtime handling — **OPEN**
+
+After four hours of downtime, what happens?
+
+- **Fast-forward** — replay every missed tick. Expensive but faithful.
+- **Compress** — summarise the gap into a digest event.
+- **Shift the world clock** — declare no in-fiction time passed.
+
+Related and settled: **`current_tick` must be persisted**, since on
+restart the engine needs to know whether it is resuming or
+fast-forwarding. That falls out of §8 for free.
 
 ---
 
-## 4. The queue
+## 5. The queue: deadlines, remaining, granularity
 
-### 4.1 Scheduling into arbitrary future ticks, not just N+1 — **RECOMMENDED, PARTIALLY CONTESTED**
+### 5.1 `due_tick` is the queue primitive — **DECIDED**
 
-The owner's original design has each action scheduling only into tick
-N+1. The objection: most activities take far longer than a second —
-walking is minutes, sleeping is hours, a journey is days. Next-tick-only
-means an entity wakes every tick just to report "still walking," and at
-scale ~99% of processed actions are no-ops.
+The queue is `due_tick -> [actions]` — a timing wheel — not a single
+next-tick list. Any action may schedule into any future tick.
 
-**Owner's counter-argument (valid and important):** action duration is
-governed by external logic — the map knows where the forest ends — and
-more critically, *putting an action to sleep appears to eliminate the
-per-step random encounter roll*, which is rolled every step-tick.
+The owner initially proposed that an action carry `ticks_remaining` and
+re-enqueue itself each tick at `remaining - 1`. That is a *scheduling
+policy*, not a storage format, and the two were separated:
 
-The second half of that objection is answered in §4.2; it turns out to
-be a false trade-off. But the first half stands: durations come from
-domain logic, and the engine should accept whatever duration it is
-given.
+- **`due_tick` is the primitive.** A per-tick action is simply one whose
+  handler always reschedules at `now + 1`.
+- **`ticks_remaining` rides along as a field** (§5.3), because it is
+  genuinely useful — especially for suspension.
 
-**Resolution:** let an action schedule into any future tick. The queue
-becomes `due_tick -> [actions]` (a timing wheel) rather than a single
-next-tick list. This is the existing design plus a `due_tick` field. In
-Postgres it falls out as:
+**Why this asymmetry matters.** With `due_tick` as the primitive, per-tick
+behaviour costs nothing (`due_tick = now + 1`). With `ticks_remaining` as
+the *only* mechanism, the engine cannot express "wake me in eight hours"
+at all. A Char sleeping until dawn is 28,800 ticks: under decrement-and-
+re-enqueue that is 28,800 wakeups, each loading a row, calling a handler
+that says "still asleep," and writing a row back. Under `due_tick` it is
+one row that sits still for eight hours. At 10,000 Chars the difference is
+roughly 10,000 row-writes per second forever versus writes only when
+something happens — and the pain shows up as autovacuum pressure on the
+one table whose index must stay fast, not as CPU.
 
-```sql
-WHERE due_tick <= :current_tick AND status = 'pending'
-```
+### 5.2 Deadlines, not countdowns — **DECIDED**
 
-A character sleeping until dawn costs one queue row for eight hours of
-world time instead of 28,800.
-
-### 4.2 Sampled waits instead of per-tick rolls — **KEY INSIGHT, ACCEPTED IMPLICITLY**
-
-This is the piece that dissolves the objection above, and it is probably
-the single most load-relevant idea in the whole design.
-
-You do not need to wake up every tick in order to roll dice every tick.
-Instead of rolling probability `p` each tick, **sample how many ticks
-until the next success** and schedule that directly. The waiting time is
-geometrically distributed:
+Anything with a duration is expressed as absolute tick numbers, compared
+rather than decremented. Poison has two clocks and needs no countdown for
+either:
 
 ```python
-k = math.floor(math.log(random.random()) / math.log(1 - p)) + 1
+class Poison(BaseAction):
+    """Damages every `interval` ticks until `expires_at`."""
+
+    def __init__(self, entity_id, interval, expires_at):
+        super().__init__(entity_id)
+        self.interval = interval
+        self.expires_at = expires_at
+
+    def process(self, sim, tick):
+        sim.emit(Damage(self.entity_id, amount=3))
+        if tick + self.interval < self.expires_at:
+            sim.schedule(self, due_tick=tick + self.interval)
+        # else: poison wears off, simply by not rescheduling
 ```
 
-This is **not an approximation**. Geometric *is* the distribution of
-"number of Bernoulli trials until first success," so the outcome
-distribution is identical to rolling every tick. One queue entry
-replaces thousands.
+Miss a tick with a countdown and it is silently wrong forever. Miss a
+tick with a deadline and nothing happens, because the deadline was never
+being maintained in the first place.
 
-So walking through a forest schedules two events:
+### 5.3 `remaining` as a field on `ActionState` — **DECIDED (owner's call)**
 
-- `encounter` at tick `N + k` (sampled)
-- `arrive` at tick `N + m` (from map/domain logic)
+`remaining` lives on the action's state object and is meaningful in both
+the active and suspended states:
 
-Whichever fires first wins; the other is tombstoned (§4.3).
+- **Active** — it ticks down alongside the deadline. Currently derived
+  and not load-bearing; kept because it is cheap and likely to find a use.
+- **Suspended** — it is the *only* record of how much is left, since the
+  deadline was dropped when the action left the queue.
 
-**Critical caveat:** this is only valid while `p` is constant. If
-conditions change — dusk falls and encounter rates rise — the pending
-roll must be invalidated and resampled under the new `p`. That is fine:
-condition changes are themselves scheduled events, and they are rare
-compared to ticks.
+Resume is then `due_tick = current_tick + remaining`. No conversion, no
+need to consult when the action began.
 
-**Generalisation:** the library should expose a family of sampled waits
-(`after_geometric(p)`, `after_uniform(lo, hi)`, `after(n)`, `at(tick)`)
-as the vocabulary handlers use to express *when* the next thing happens.
-This is where the "chances and durations" framework the owner wants
-actually lives.
+### 5.4 Granularity: per-tick rolling is the default — **DECIDED (reverses v1)**
 
-### 4.3 Tombstoning, not removal — **RECOMMENDED**
+v1 recommended replacing per-tick probability rolls with **sampled waits**
+— sampling how many ticks until the next success from a geometric
+distribution and scheduling that directly, so one queue entry replaces
+thousands. The claim that it is *exact* rather than approximate is
+correct: geometric is by definition the distribution of "trials until
+first success."
 
-Events get invalidated: the encounter fires, so the arrival is moot; the
-target dies in another event first. Marking the row dead and skipping it
-on pop is simpler than removing from a heap, and it preserves an audit
-trail of what *would* have happened. `ActionStatus.CANCELLED` serves
-this.
+**Reversed, for a reason v1 did not weigh.** Sampled waits are valid only
+while `p` is constant. In this game `p` depends on the Char's stats *and*
+the environment's stats — the Char is wounded, night falls, they are
+carrying more. Every change invalidates the pending sample and forces a
+resample, and if `p` moves often the resampling churn eats the savings
+the sampling was meant to buy. Rolling each tick lets `p` vary
+continuously and is far easier to reason about.
 
-An important consequence of §4.2 + §4.3 together: **an entity routinely
-has multiple pending actions at once.** This directly contradicts
-storing "current action" as a single field on entity state (see §6.2).
+**What is kept:** the ability to schedule arbitrarily far into the
+future (§5.1). Sleep-until-dawn needs it and per-tick cannot express it.
+`geometric` may still ship as an available sampled wait; it is simply not
+the default pattern.
 
-### 4.4 Durable queue, memory as cache — **RECOMMENDED**
+**Not lost, for future reference:** the geometric sample is *memoryless*,
+so resampling from the moment `p` changes is exactly equivalent to having
+rolled per-tick through the change. No bookkeeping of "how far into the
+old roll we were" is ever required. If sampled waits are revisited, this
+is the fact that makes them safe.
 
-The world runs for months. An in-process heap dies with the process, and
-"server restarted, all pending events vanished" is unrecoverable when
-the history is the content.
+### 5.5 Tombstoning, not removal — **DECIDED**
 
-Shape:
+Invalidated actions are marked cancelled and skipped on pop, rather than
+removed. Simpler than removing from a heap, and it preserves an audit
+trail of what *would* have happened.
 
-- **Postgres table is the source of truth** — `(id, entity_id, kind,
-  due_tick, payload, status, seq)`, indexed on `(due_tick, status)`.
-- **In-memory heap/buckets as a read-through cache** of the near horizon
-  — pull the next N minutes, work from memory, write results back
-  transactionally.
-- **`SELECT ... FOR UPDATE SKIP LOCKED`** for claiming work. This
-  handles the single-worker case fine and permits adding a second worker
-  later without redesign.
+**Consequence:** an entity routinely has several pending actions at once —
+an arrival, a cooldown expiry, a hunger tick, a poison effect. The queue
+is therefore its own table keyed by `entity_id`, never a `current_action`
+field on the entity. The scheduler's hot query ("everything due at or
+before tick N") then hits one index on one table instead of scanning
+every entity in the world.
 
-**Consequence — idempotency.** Durability means crash-between-"handler
-ran"-and-"event marked done" is a normal occurrence. At-least-once
-delivery means handlers must be idempotent, or processing must be
-transactional (effects and status flip in one transaction). Otherwise
-the hero occasionally kills the same rat twice. This must be designed
-in, not patched later.
-
-**Library boundary:** persistence is an *interface* in the core, not an
-implementation. The library ships an in-memory store; the game plugs in
-a Postgres one. That boundary is what keeps the library reusable.
+There is still a good reason to keep something action-shaped on the
+entity's state: the observer needs to read *"Ivan wanders through the
+pines."* That is a **denormalised display cache** of current narrative
+activity — explicitly not the scheduling source of truth. Keeping the two
+roles distinct is what stops them silently drifting apart.
 
 ---
 
-## 5. Determinism and randomness
+## 6. Suspension and activity groups — **DECIDED**
 
-### 5.1 Two-phase tick: decide then apply — **ACCEPTED ENTHUSIASTICALLY**
+### 6.1 The problem
 
-**Problem.** If a beast and a character both act in tick 5000, whoever
-is processed first sees a clean world and the second sees the first's
-mutations. Outcomes then depend on arbitrary queue ordering.
+"The walk stands suspended until the battle is over" sounds like one
+action, but it is not. Walking through a forest has several pending
+actions — the arrival, and whatever produces encounters. Suspending the
+walk means suspending all of them. Meanwhile poison should keep ticking
+during the fight, and so should hunger.
 
-**Solution.** Split the tick:
+So `suspend(action_id)` is too narrow and `suspend_all_for(entity)` is
+too broad.
 
-1. **Decide phase** — every due action reads a *frozen snapshot* of
-   tick-start state and emits **intents**. No mutation whatsoever.
-2. **Apply phase** — all intents are resolved together; only this phase
-   writes.
+### 6.2 The rule
 
-This makes ticks order-independent, which in turn permits
-parallelisation, retries, and replay without changing results.
+- **Effects** — poison, hunger, cooldowns — belong to no group and keep
+  firing through any suspension.
+- **Activities** — walking, crafting, travelling — are bundles of actions
+  sharing an opaque **`group_id`**, minted when the activity starts.
+  Suspension operates on the bundle.
 
-**Owner's extension (good, and adopted):** intents involving multiple
-parties should link to a shared **Event** — e.g. a fight with two
-participants — where intents are locked in first and then resolved
-*inside* the Event. This is the basis of the framework in §7.
+The engine never interprets `group_id`. It is a string it can group by,
+nothing more. *Which* activities suspend under *which* circumstances is
+game policy and lives entirely in game code.
 
-**Additional requirement identified:** a resolver must **re-validate its
-participants** at resolution time. Between decide and resolve, a
-participant may have died in a different event during the same tick.
-Degrade gracefully; never assume both parties still exist.
+### 6.3 Consequence for action granularity
 
-### 5.2 Per-entity RNG streams — **RECOMMENDED, OWNER INITIALLY DISAGREED, LIKELY A MISUNDERSTANDING**
+v1 listed "is one action one narrative beat?" as an open question. It is
+effectively answered by the above: **an activity is the narrative beat;
+the actions inside it are machinery.** The observer reads "Ivan wanders
+through the pines" — one activity. The engine sees an arrival action and
+an encounter-roll action — two actions, one `group_id`.
 
-**Owner's position:** use a global, fully random RNG, so that walking
-through the forest now and in ten million ticks produces completely
-different outcomes.
+### 6.4 `BaseAction` carries the bookkeeping
 
-**The misunderstanding:** per-entity seeding does *not* mean repeated
-situations produce repeated results. The tick is part of the seed:
+Every action that inherits `BaseAction` gets suspend/resume for free. The
+game developer never writes it, and therefore cannot get `remaining`
+wrong on suspend — which is exactly the class of silent bug this design
+exists to prevent.
 
 ```python
-rng = random.Random(hash((world_seed, entity_id, tick, event_seq)))
+class BaseAction:
+    def __init__(self, entity_id, remaining=None, group_id=None):
+        self.entity_id = entity_id
+        self.remaining = remaining
+        self.group_id = group_id
+        self.state = ActionState.ACTIVE
+
+    def suspend(self, tick):
+        self.remaining = self.due_tick - tick
+        self.state = ActionState.SUSPENDED
+
+    def resume(self, tick):
+        self.due_tick = tick + self.remaining
+        self.state = ActionState.ACTIVE
 ```
 
-Tick 500 and tick 10,000,000 give completely different streams. The same
-path walked a million ticks later yields a different outcome — exactly
-what the owner wants. Unpredictability across time is fully preserved.
+---
 
-**What per-entity seeding buys:** outcomes stop depending on *processing
-order*. With a shared global RNG, whichever entity is processed first
-consumes the next value, so:
+## 7. Actions: objects, protocols, `BaseAction`
 
-- Tick processing **cannot be parallelised** without changing outcomes.
-- A failed handler **cannot be retried** — it consumes different values
-  on retry.
-- Bugs **cannot be reproduced**. "My character died strangely around
-  tick 4.2 million" becomes uninvestigable.
+### 7.1 An action is an object with `process()` — **DECIDED (reverses v1)**
 
-The last point is the real cost, and it bites hardest in exactly this
-genre: when the log is the product, players *will* ask why something
-happened, and the system should be able to replay it and answer.
+v1 specified `Action` as **data only**, with behaviour looked up by
+`kind` in a registry, on the grounds that this is what lets an action be
+a Postgres row.
 
-Note also that this directly undermines the order-independence won in
-§5.1 — a global RNG reintroduces order-dependence through the back door.
+**Reversed.** The library is a set of interfaces; the natural shape is an
+object the consumer implements. The serialisation concern is real but it
+is the **store's** problem, not the action's (§7.3).
 
-**Mundane but real:** Python's module-level `random` is not safe to
-share across threads or workers. This becomes a correctness bug the
-moment the system scales past one process.
+### 7.2 Protocol for the contract, base class for the bookkeeping — **DECIDED**
 
-**Status:** explained but not explicitly agreed. Worth revisiting early,
-because retrofitting deterministic RNG is painful and the whole replay
-story depends on it.
+Two mechanisms, used for different jobs:
+
+```python
+class Action(Protocol):        # the contract the engine requires
+    def process(self, sim, tick) -> None: ...
+
+class BaseAction:              # optional convenience; satisfies the contract
+    """Handles remaining / state / group_id so you don't have to."""
+```
+
+For most of foliot — `Store`, `Driver`, `Rng` — a **Protocol** is right:
+pure contracts with no state of their own, so structural typing keeps the
+game from importing the library merely to satisfy a type, while
+`mypy --strict` still catches a missing or wrong-signatured method at the
+point of use.
+
+`Action` is the exception, because it carries bookkeeping the *engine*
+owns: `remaining`, active/suspended state, `group_id`, `due_tick`, `seq`.
+A bare Protocol would force every game to reimplement that correctly.
+
+The engine only ever type-checks against the **Protocol**, so it never
+depends on anyone inheriting. In practice nearly everyone inherits
+`BaseAction`; someone with an unusual model can implement the protocol
+directly and foliot still accepts it.
+
+### 7.3 Serialisation belongs to the store — **DECIDED**
+
+An object in RAM does not survive a restart, and the world runs for
+months, so pending actions must reach disk. A row is columns — text,
+numbers, JSON — and cannot hold a Python object. Something must convert.
+That conversion is all "serialise" means.
+
+**Why not `pickle`.** Pickle stores a *pointer to the class by name*.
+Demonstrated concretely during this session: pickle a `WalkAction`,
+rename the class to `Walk` in a routine refactor, and the next load
+fails —
+
+```
+AttributeError: Can't get attribute 'WalkAction' on <module 'game.actions'>
+```
+
+Ivan is stuck mid-forest forever, and the only fix is renaming the class
+back. Same breakage on moving the file, or adding a required field that
+old rows lack.
+
+**The `kind` + `payload` alternative.** Store plain data and a label:
+
+| kind | payload | due_tick |
+|---|---|---|
+| `walk` | `{"destination": "oakvale", "remaining": 340}` | 5340 |
+
+Nothing in that row is Python, so nothing in it can break. Rebuilding is
+a dictionary lookup:
+
+```python
+REGISTRY = {"walk": Walk, "poison": Poison}
+
+def decode(kind, payload):
+    return REGISTRY[kind](**payload)
+```
+
+That dictionary is the whole of "the registry."
+
+**Where foliot stands.** It does not impose `kind` on anyone.
+
+- **In memory, no conversion happens at all.** The in-memory store holds
+  the objects. No `kind`, no payload, no registry. Layer 1 never mentions
+  any of it.
+- **For durability, the consumer supplies two functions**, and the
+  library states the contract without implementing it:
+
+```python
+def encode(action) -> tuple[str, dict]: ...   # object -> (kind, payload)
+def decode(kind, payload) -> Action: ...      # (kind, payload) -> object
+```
+
+The Postgres store asks for that pair; the memory store does not. So
+`kind` is part of the *storage* design, appearing only when a durable
+store is plugged in — not a tax the core charges everyone.
+
+### 7.4 Handler contract conventions — **DECIDED**
+
+Two conventions carry most of the testability:
+
+- Handlers **return or emit** scheduling requests rather than reaching
+  into the queue directly.
+- Handlers get randomness from **`ctx.rng` / `sim.rng`**, never from the
+  `random` module.
+
+Together these make a handler a plain function callable in a test with a
+fake context and asserted on by return value, rather than something
+observable only by running the world. If a handler cannot be tested that
+way, the contract has been violated somewhere.
 
 ---
 
-## 6. Entity and state model
+## 8. Persistence: the tick is the transaction — **DECIDED**
 
-### 6.1 Owner's model — **DECIDED (owner's call)**
+### 8.1 The division of labour
 
-- **`entity`** — the character's slow-changing characteristics: level,
-  max HP, skill points, learned skills.
-- **`entity_state`** — current HP, current mana, cooldowns, inventory,
-  and the current Action.
+**foliot owns *when* to save. The game owns *how* and *where*.** The
+library ships no database and no dependency, but it does not leave the
+timing to the game, because the timing is the hard part and only the
+engine knows it.
 
-The two-tier split is reasonable and the table boundary is sensible.
+This follows from §2: two of foliot's guarantees — nothing pending is
+lost, nothing is applied twice — are properties of the boundary between
+memory and disk. A library that says "persistence is your problem" cannot
+make them, and is then just a scheduler.
 
-### 6.2 Corrections and cautions
+### 8.2 Not periodic checkpointing
 
-**(a) "Current Action" as a single field cannot hold the design.**
-Per §4.2 and §4.3, an entity routinely has several pending events at
-once: a sampled encounter, an arrival, a cooldown expiry, a hunger tick,
-a poison effect. A single field holds one.
+Saving "from time to time" was considered and rejected. Checkpoint every
+60 seconds, crash at 59, and:
 
-The queue therefore wants to be **its own table** with `entity_id` as a
-foreign key, not a field on the entity. The scheduler's hot query
-("everything due at or before tick N") then hits one index on one table
-instead of scanning every entity in the world.
+- Ivan's walk shows 340 ticks remaining on disk, but the wolf that killed
+  him was resolved 40 seconds ago and *that* effect already reached the
+  world tables.
+- The queue and the world now disagree, and nothing in the system can say
+  which is right.
 
-There is still a good reason to keep something action-shaped on
-`entity_state`: the observer needs to read *"Ivan wanders through the
-pines."* But that is a **denormalised display cache** of current
-narrative activity — explicitly not the scheduling source of truth.
-Keeping the two roles distinct is what stops them silently drifting
-apart.
+The world and the queue must move together or the state is incoherent,
+and there is exactly one moment when they are guaranteed coherent: the
+tick boundary.
 
-**(b) The "static" tier is not static.** Level, max HP, skill points and
-learned skills all change on level-up or training. That is fine as a
-table split — they change on the order of days, not seconds — but it is
-a *slow/fast* distinction, not *immutable/mutable*. Naming it honestly
-matters: internalising "entity is immutable" leads to aggressive caching
-and stale max-HP after a level-up.
+### 8.3 What lands atomically
 
-**(c) Inventory as a field will strain — DEFERRED BY OWNER.**
-An item dropped in a clearing, or traded between characters, has no home
-in an inventory blob; a transfer becomes two blob rewrites with nothing
-enforcing that the sword exists in exactly one place. If items ever have
-identity (durability, provenance), they want their own table with a
-nullable owner (`NULL` = on the ground / in a container).
+Everything tick N did — actions marked done, new ones enqueued,
+cancellations, suspensions, effects applied, `current_tick` advanced —
+lands as one atomic write, or none of it does.
 
-**Owner explicitly deprioritised this**, and rightly so — it is
-game-modelling, not core-library work. If inventory stays
-`{"herbs": 3}`, a JSON column is fine. Recorded only so the constraint
-is known when it eventually matters.
+At 1 tick/second that is 86,400 transactions a day, which is nothing for
+Postgres. Under `ManualDriver` with the in-memory store it costs zero,
+because the transaction is a no-op.
 
-### 6.3 Scope discipline — **EXPLICIT OWNER INSTRUCTION**
+### 8.4 This closes the idempotency question
 
-The owner pushed back on discussion of enchantments, item identity, and
-similar game-domain modelling. The instruction is clear and should be
-respected in the next session:
+v1 listed "idempotent handlers vs. fully transactional application" as
+open. If the tick is the transaction, the question dissolves: there is
+never a half-applied tick, so on restart you read `current_tick` and
+continue. The wolf cannot be killed twice, because "the wolf was killed"
+and "that action was marked done" are the same write.
 
-> Build the **core** — the clock, the queue, the calling and resolving
-> mechanism, and a framework for events with chances and durations —
-> **with nothing particularly tied** to any specific game.
+**The one honest caveat.** This holds while effects land in the same
+transactional store as the queue. If an effect reaches outside — a
+different database, an HTTP call, a notification email — atomicity is
+impossible and *those specific effects* must be made idempotent by
+whoever writes them. foliot should say so in the docstring rather than
+pretending otherwise.
 
-Game-domain modelling is out of scope until the core exists.
+### 8.5 The `Store` protocol
+
+Small, and it names the boundary rather than the storage:
+
+```python
+class Store(Protocol):
+    def current_tick(self) -> int: ...
+    def due(self, tick: int) -> Iterable[Action]: ...
+    def tick_transaction(self, tick: int) -> ContextManager[Txn]: ...
+```
+
+The engine runs each tick inside `tick_transaction` and routes everything
+it changes through the handle it gets back. The engine never calls
+"save" — it does its work inside a boundary the store defines. For the
+in-memory store that context manager does nothing; for Postgres it is
+`BEGIN` / `COMMIT`. That is precisely why the interface asks for a
+context manager rather than a `save()` method: `BEGIN`/`COMMIT` is a shape
+a dictionary can ignore for free.
+
+Caching is the store's business too. The near-horizon window — pull the
+next few minutes into memory rather than querying every tick — is an
+optimisation a Postgres store makes internally. The engine just asks
+`due(tick)` and does not care whether that hit RAM or disk.
+
+### 8.6 The shape, end to end
+
+A deliberately minimal sketch — no ordering, no RNG, no statuses — showing
+only who owns what. This ran; the output is in the comments.
+
+```python
+# ---------- what foliot ships ----------
+class Simulation:
+    def __init__(self, store):
+        self.store = store                            # game hands it in here
+
+    def run(self, until):
+        tick = self.store.current_tick()
+        while tick < until:
+            with self.store.tick_transaction(tick):   # library opens boundary
+                for action in self.store.due(tick):
+                    action.process(self, tick)        # your object, your method
+            tick += 1
+
+
+# ---------- what the game developer writes ----------
+class Walk:
+    def __init__(self, entity_id, remaining):
+        self.entity_id, self.remaining = entity_id, remaining
+
+    def process(self, sim, tick):
+        self.remaining -= 1
+        if self.remaining > 0:
+            sim.store.schedule(self, due_tick=tick + 1)
+        else:
+            print(f"tick {tick}: {self.entity_id} ARRIVES")
+
+
+class MyStore:
+    def __init__(self):
+        self.queue, self.tick = {}, 0
+    def current_tick(self):  return self.tick
+    def due(self, tick):     return self.queue.pop(tick, [])
+    def schedule(self, action, due_tick):
+        self.queue.setdefault(due_tick, []).append(action)
+    def tick_transaction(self, tick):
+        ...  # no-op in memory; BEGIN/COMMIT against Postgres
+
+
+Simulation(store=MyStore()).run(until=3)
+```
+
+| foliot | the game |
+|---|---|
+| `Simulation` — holds the clock, owns the loop | `Walk` — an object with `process()` |
+| opens and closes the tick boundary | `MyStore` — three methods over its own database |
+| decides *when* to save | decides *where* and *how* to save |
+| defines the `Store` protocol | implements it |
+
+The developer's entire persistence obligation is writing `MyStore` once.
+After that they write `process()` methods and never think about saving.
 
 ---
 
-## 7. The framework layer (entity / action / intent / event / resolver)
+## 9. Randomness — **DECIDED**
 
-This is the layer that makes the project a framework rather than a loop.
-A protocols module was drafted; see §9 for the full source.
+### 9.1 Per-entity, counter-based streams
 
-### 7.1 The governing discipline
+```python
+rng = counter_rng(world_seed, entity_id, tick, seq)
+```
 
-**The core never knows what an entity is.** No HP, no position, no
-Postgres. It knows about ticks, scheduled actions, intents, resolution,
-and randomness. The game supplies meaning by registering deciders and
-resolvers and by implementing `Effect` and `World`.
+`world_seed` is drawn from the clock **once**, when the world is created.
+So the world is born unpredictable and is only reproducible in the sense
+that, having happened, it can be re-derived.
 
-### 7.2 Pipeline
+**Determinism is not predictability.** Because `tick` is part of the
+seed, walking the same forest path at tick 500 and at tick 10,000,000
+draws from completely unrelated streams. Nothing repeats and nothing is
+guessable. This was the original misunderstanding and it is worth
+restating whenever it comes up.
+
+### 9.2 Why a global stream fails: the Ivan/Petra example
+
+The objection to a shared global RNG is not philosophical. Consider tick
+5000, with two fights that have nothing to do with each other:
+
+- **Event A** — Ivan vs a wolf in the forest
+- **Event B** — Petra vs a bear, a thousand miles away
+
+A global RNG is one stream with one cursor, about to produce
+`0.91, 0.12, 0.44, 0.03`. A hit needs a roll under 0.5.
+
+- Resolve **A first**: Ivan takes `0.91` → miss. The wolf takes `0.12` →
+  hit. Then Petra takes `0.44`, the bear `0.03`.
+- Resolve **B first**: Petra takes `0.91`, the bear `0.12`. Then **Ivan
+  takes `0.44` → hit**, and the wolf `0.03`.
+
+Same tick, same state, same intents, same resolver. Ivan lives or dies
+depending on whether Petra's fight was processed first. **Petra changed
+Ivan's outcome and she is on another continent** — which is exactly the
+per-character isolation property (§1.5) that everything else is built to
+protect. The coupling is the cursor position, and the cursor appears in
+no table.
+
+Two direct consequences:
+
+- **Crash recovery becomes lossy.** Re-running the unfinished events of a
+  partially-written tick draws from a different cursor position, so the
+  world after recovery is not the world that was interrupted.
+- **The queue can never be reordered.** No parallel workers, no
+  `SKIP LOCKED` with two processes, no out-of-order batches — all of them
+  change outcomes.
+
+Note also that a global RNG silently cancels the order-independence won
+by the two-phase design (§10.1). It reintroduces order-dependence through
+the back door.
+
+### 9.3 Cost, measured
+
+The owner's concern — that per-entity seeding would be expensive — is
+correct about the naive implementation. Measured on Python 3.11,
+200,000 draws each:
+
+| Approach | per draw | draws/sec |
+|---|---|---|
+| shared global `random.random()` | 0.054 µs | 18.5M |
+| new `Random(seed)` for every draw | 6.37 µs | 157k |
+| one `Random` per (entity, tick), 4 draws | 1.59 µs | 631k |
+| **counter-based (splitmix64), no state** | **0.32 µs** | **3.1M** |
+| keyed `blake2b(8)` per draw | 0.49 µs | 2.0M |
+
+The naive version is **118× slower** than the global stream, and the
+reason is mechanical: `random.Random(seed)` builds a Mersenne Twister —
+624 words of internal state initialised from the seed — and then throws
+all of it away to take one float. You pay for a 19937-bit generator to
+get 53 bits out.
+
+**The fix is to stop constructing a generator and start computing the
+answer.** A counter-based PRNG hashes
+`(world_seed, entity_id, tick, seq, draw_index)` straight into a number:
+a handful of integer multiplies and shifts, no state, no setup. This is
+the standard approach (Random123 / Philox in the numerics world) and it
+is designed for exactly this situation — enormous numbers of independent,
+addressable streams.
+
+At 10,000 Chars making five draws each per tick — 50k draws/second —
+splitmix64 costs about **1.6% of one core**. Not a cost worth designing
+around. And it is *better* than a Mersenne Twister here, because every
+draw is independently addressable: you can ask "what was Ivan's third
+roll in tick 5000?" a year later without replaying anything.
+
+### 9.4 A real bug in the v1 snippet
+
+v1 §5.2 wrote `hash((world_seed, entity_id, tick, seq))`. **Python's
+`hash()` on strings is salted per process** (`PYTHONHASHSEED`), so
+`hash("ivan")` differs between runs of the same program. That snippet
+silently breaks replay across a restart, in a way that looks like a rare
+mysterious bug rather than a configuration problem.
+
+Use a stable hash — `blake2b`, or pure integer mixing on integer ids.
+Cheap to get right, nasty to diagnose later.
+
+### 9.5 Deterministic ids for spawned entities — **DECIDED**
+
+Ephemeral entities (a wolf, §11.2) still need an identity while they
+exist, because the RNG seeds on `entity_id`. If that id comes from
+`uuid4()`, replay is dead.
+
+The game's design makes this easy: an ephemeral entity never exists
+outside its event, so its id can be derived — `(event_id, 0)`,
+`(event_id, 1)` — from an event that already has an identity. Stable and
+reproducible for free. No database row, no UUID.
+
+---
+
+## 10. Layer 2: intents, events, resolvers
+
+### 10.1 The two-layer split — **DECIDED**
+
+foliot is built as two layers, and **layer 1 must be complete and useful
+without layer 2**.
+
+- **Layer 1** — clock, queue, drivers, RNG, store, actions. A handler is
+  `process(sim, tick)`, emitting schedules, cancels and effects. No
+  intents, no grouping. This alone runs walking, poison, cooldowns,
+  travel — most of a world.
+- **Layer 2** — intents, event grouping, resolvers. A separate importable
+  module, added after layer 1 is real.
+
+If layer 1 cannot be used without layer 2, we have built a framework with
+a mandatory opinion. If it can, we have built a library.
+
+**Why layer 2 is in at all**, by the §2 test: it adds a guarantee the
+consumer cannot bolt on — **simultaneity.** N participants each decide
+against the same frozen state, and no participant observes another's
+mutations. That requires controlling the decide/apply split inside the
+tick, which is the engine's job.
+
+The pipeline it provides:
 
 ```
 queue.due(tick)                -> [Action]
@@ -507,48 +858,61 @@ queue.due(tick)                -> [Action]
   apply effects, enqueue schedules, tombstone cancels
 ```
 
-The decide phase never mutates. The resolve phase never reads anything
-it was not handed. That split is what makes ticks order-independent.
+The decide phase never mutates. The resolve phase never reads anything it
+was not handed. That split is what makes ticks order-independent.
 
-### 7.3 The pieces
+**A resolver must re-validate its participants** at resolution time.
+Between decide and resolve, a participant may have died in a different
+event during the same tick. Degrade gracefully; never assume both parties
+still exist.
 
-**`Action`** — the unit the queue stores. **Data only, no behaviour**:
-`kind` is looked up in a decider registry. This keeps actions trivially
-serialisable, which is precisely what lets the queue live in Postgres
-instead of process memory. Carries a `seq` field for deterministic
-tie-breaking within a tick — ordering must be *total and deterministic*
-even though resolution is order-*independent*, so that replays match
-exactly.
+### 10.2 The rendezvous problem is resolved — **DECIDED (closes v1 §8.1)**
 
-**`Intent`** — what an entity wants to do, before anyone knows whether
-it succeeds. Emitted by deciders.
+v1's blocking question was: how do two parties independently arrive at
+the same `event_key`? Option A was symmetric derivation (both compute
+`combat:` plus the sorted pair of ids); Option B was an explicit event
+entity that one party opens and the other references.
 
-**`Event`** — a bundle of intents sharing an `event_key`, resolved
-together as one unit.
+**The game's design answers it: Option B, and the rendezvous largely
+disappears.** The environment *opens* the event and enrols participants,
+so nobody has to guess a key. Consequences:
 
-**`Outcome`** — everything a resolver produces: `effects`, `schedules`,
-`cancels`, `log`. Purely descriptive; no side effects.
+- `Event` **is persisted**: it has an identity, a lifetime, and something
+  must close it.
+- Option A remains available for incidental interactions where nobody
+  needs to open anything. The two coexist.
+- This unblocks the registry and the schema, which v1 flagged as gated.
 
-**`Effect`** — a game-defined mutation object with `apply(world)`.
-Effects are the only thing permitted to write.
+### 10.3 No reaction pass is needed — **DECIDED**
 
-**`Decider`** — `(ctx, action) -> Iterable[Intent]`, registered against
-`Action.kind`.
+A concern raised and then dissolved. "The forest decides whether a wolf
+appears" implies the environment acts *because it was targeted*, not
+because it had something due — which would require a second pass in the
+tick pipeline that the design does not have.
 
-**`Resolver`** — `(ctx, event) -> Outcome`, registered against
-`Intent.event_kind`.
+It is not needed, because of one detail in the game's design: the
+forest's roll happens **inside the walking Char's own decide**, and the
+resulting event is **scheduled for the next tick** rather than created
+mid-tick. So the pipeline stays single-pass: decide, group, resolve. No
+ordering subtlety about who reacts to whom.
 
-**`Rng`** — per-entity, per-tick randomness, including the sampled waits
-from §4.2.
+### 10.4 The layer-2 vocabulary
 
-**`Entity`** — deliberately almost empty (just `id`). The engine only
-ever needs to *identify* an entity, never to interpret it.
+Carried forward from v1, which got this part right:
 
-**`World`** — read access, required to present a *stable* view for the
-duration of a tick's decide phase. How (snapshot, copy-on-write, MVCC
-transaction) is the implementation's problem, not the interface's.
+- **`Intent`** — what an entity wants to do, before anyone knows whether
+  it succeeds. Emitted by deciders.
+- **`Event`** — a bundle of intents sharing an `event_key`, resolved
+  together as one unit.
+- **`Outcome`** — everything a resolver produces: `effects`, `schedules`,
+  `cancels`, `log`. Purely descriptive; no side effects.
+- **`Effect`** — a game-defined mutation object with `apply(world)`.
+  Effects are the only thing permitted to write.
+- **`World`** — read access, required to present a *stable* view for the
+  duration of a tick's decide phase. How (snapshot, copy-on-write, MVCC
+  transaction) is the implementation's problem.
 
-### 7.4 Two deliberate design calls that may want reversing
+Two deliberate calls worth remembering:
 
 **Effects as objects rather than direct mutation.** Costs a layer of
 indirection. Buys: resolvers stay pure and unit-testable (call with a
@@ -557,668 +921,173 @@ audit trail of *why* state changed, and application order becomes
 explicit rather than incidental.
 
 **`log` as a first-class `Outcome` field** rather than derived from
-effects. Justification: in a ZPG the log *is* the product, so
-observer-facing narrative deserves its own channel rather than being
-scraped out of mutations afterwards.
-
-### 7.5 Handler contract conventions
-
-Two conventions carry most of the testability:
-
-- Handlers **return** scheduling requests rather than reaching into the
-  queue.
-- Handlers get randomness from **`ctx.rng`**, never the `random` module.
-
-Together these make a handler a plain function that can be called in a
-test with a fake context and asserted on by return value, rather than
-something observable only by running the world.
-
-### 7.6 Sketch of the intended public API
-
-```python
-sim = Simulation(seed=42, store=InMemoryStore())
-
-@sim.handler("wander")
-def wander(ctx, payload):
-    return [
-        ctx.schedule("encounter", after=ctx.rng.geometric(p=0.01)),
-        ctx.schedule("arrive", after=payload["distance"]),
-    ]
-
-sim.run(RealtimeDriver(tick_seconds=1.0))     # production
-sim.run(ManualDriver(until_tick=10_000_000))  # tests, fast-forward
-```
+effects. In a ZPG the log *is* the product, so observer-facing narrative
+deserves its own channel rather than being scraped out of mutations.
 
 ---
 
-## 8. The open question the conversation paused on
+## 11. The game model (recorded here, built elsewhere)
 
-### 8.1 The rendezvous problem — **UNRESOLVED, BLOCKS THE REGISTRY**
+Recorded so the library's requirements are traceable to something. **None
+of this belongs in `src/foliot/`.**
 
-`event_key` is the entire grouping mechanism. Intents emitted in the
-same tick sharing a key are bundled into one Event and resolved
-together; that is how a character's "swing at the beast" and the beast's
-"bite the character" become a single fight instead of two independent
-resolutions. Solo intents get a synthesised unique key, so a lone action
-is just a one-participant event — no special case in the engine.
+### 11.1 Actions are directed
 
-**But: how does the beast know which key to use?** Two viable answers,
-and they are materially different systems:
+Every action in the game is defined by two things: who is doing it, and
+what it is done against.
 
-**Option A — symmetric derivation.** Both parties independently compute
-the same key from shared facts, e.g. `combat:` plus the sorted pair of
-entity IDs. No coordination needed. But it only works when both sides
-genuinely decide to engage each other *in the same tick*; near-misses
-produce two solo events instead of one fight.
+- walking in the forest — `walk(Char, Forest)`
+- being poisoned while walking — `damage_effect(Forest, Char)`
 
-**Option B — explicit event entity.** One party opens a combat, receives
-an id, writes it somewhere the other can observe it, and subsequent
-intents reference it. This matches the owner's earlier instinct, handles
-multi-tick fights and bystanders joining mid-fight, but the engine now
-needs a notion of **event lifetime** and something must close it.
+An action is a directed edge. In library terms only the *owner* matters
+(§3); the target is game payload.
 
-**Assessment offered:** likely Option B for fights, Option A for
-incidental interactions.
+### 11.2 The entity ontology
 
-**Why this must be decided before the registry is written:** it
-determines whether `Event` needs to be **persisted at all**, or can
-remain a per-tick ephemeral bundle. That is a load-bearing distinction.
+- **Char** — a player's character. The **only** entity that persists
+  independently of its environment, and therefore the only
+  self-sufficient actor: a **first-order action producer**. Chars
+  schedule their own next action.
+- **EventfulEnvironment** — a place (a forest). It is an entity, so it
+  has somewhere to stand when it acts. It acts **only when targeted** —
+  a Char walking through it gives it its chance to roll — and it can
+  *spawn events*, which is what makes it "eventful."
+- **Second-order action producers** — a wolf. Spawned by an environment,
+  produces actions only inside an event, and does not exist outside that
+  event at all.
 
-### 8.2 The immediate next piece of work
+**Why this matters to the library.** If only Chars schedule their own
+next action, the queue is a forest of independent per-Char timelines that
+touch only inside Events. That is exactly the per-character isolation
+guarantee of §1.5, obtained for free — and it is what makes sharding and
+out-of-order processing valid rather than merely tempting. The core
+cannot enforce this rule, but it should be recorded as a game invariant.
 
-The **registry plus the tick loop** — the code that walks
-decide → group → resolve → apply. The owner was offered the choice of
-building this or settling §8.1 first, and paused the conversation here to
-capture this document.
+### 11.3 Suspension in game terms
 
----
+If an event involving another entity is produced — a wolf appears — the
+walking activity is **suspended** and resumes when the battle event is
+over. Poison, hunger and cooldowns continue throughout (§6.2).
 
-## 9. Naming — **DECIDED**
+### 11.4 Battle, in the layer-2 vocabulary
 
-The library is called **`foliot`**.
+On the tick, every participant issues an **intent** against the other's
+`entity_state`. The resolver then looks at both participants' stats and
+decides which intents go through: the wolf bites, the Char misses, and
+the Char's miss did not affect the wolf's bite at all — because both were
+decided from the same frozen tick-start state.
 
-A foliot is the oscillating crossbar in the earliest mechanical clocks —
-the bar that swings back and forth and lets the gear train advance one
-step at a time. It is, literally, a tick generator, which is what this
-library is. Six letters, unambiguous spelling, no ecosystem collisions,
-reads cleanly as `import foliot`, and obscure enough that it belongs to
-this project on first use.
+### 11.5 Two-tier entity state
 
-PyPI name was free at time of writing. Claiming it is cheap insurance
-even if nothing is ever published; the GitHub namespace is separate and
-should be checked independently.
+- **`entity`** — slow-changing: level, max HP, skill points, learned
+  skills.
+- **`entity_state`** — fast-changing: current HP, current mana,
+  cooldowns, inventory.
 
-**Rejected, recorded so they are not re-litigated:**
+Two cautions recorded from v1 and still valid:
 
-- `escapement` — best metaphor available (converts continuous energy
-  into discrete ticks), but **taken on PyPI**.
-- `mainspring` — good metaphor and free, but "spring" reads as Spring
-  Framework / Spring Boot to anyone from the JVM world. **Rejected by
-  the owner on those grounds.**
-- `cadence` — free on PyPI, but Uber's Cadence is a well-known durable
-  workflow-and-timer engine in the same problem domain (now Temporal).
-  Namespace confusion.
-- `clepsydra` — lovely (water clock), but you would be spelling it aloud
-  forever.
-- `fusee`, `remontoire` — good horological metaphors, both free;
-  runners-up if `foliot` ever needs replacing.
-- Also taken: `systole`, `pendulum`, `metronome`, `chronon`, `cogwheel`,
-  `tourbillon`, `vivarium`, `clotho`, `moirai`, `kairos`.
+**The "static" tier is not static.** Level, max HP and learned skills all
+change on level-up or training. It is a *slow/fast* distinction, not
+*immutable/mutable*. Internalising "entity is immutable" leads to
+aggressive caching and stale max-HP after a level-up.
 
-The game project is unnamed and does not need a name yet.
+**Inventory as a field will strain — deliberately deferred.** An item
+dropped in a clearing, or traded between characters, has no home in an
+inventory blob; a transfer becomes two blob rewrites with nothing
+enforcing that the sword exists in exactly one place. If items ever have
+identity (durability, provenance), they want their own table with a
+nullable owner (`NULL` = on the ground). Recorded only so the constraint
+is known when it eventually matters. **Not core-library work.**
 
 ---
 
-## 10. Repository layout
+## 12. Repository layout and tooling
 
-Proposal, not gospel. Single repo for the library; the game lives
-separately and depends on it.
+### 12.1 Layout
 
 ```
 foliot/
 ├── pyproject.toml              # uv-managed
-├── uv.lock
+├── uv.lock                     # committed
 ├── README.md
 ├── CLAUDE.md
 ├── docs/
 │   ├── DESIGN_SNAPSHOT.md      <- this document
 │   └── reference/
-│       └── protocols-draft.py  # §16 — REFERENCE ONLY, never imported
+│       └── protocols-draft.py  # v1 reference only; never imported
 ├── src/
 │   └── foliot/
 │       ├── __init__.py         # curated public API surface
-│       ├── py.typed            # required; see §17
-│       ├── protocols.py        # the real contracts, written fresh
-│       ├── rng.py              # per-entity streams + sampled waits
-│       ├── registry.py         # kind -> decider / resolver
-│       ├── engine.py           # the tick pipeline
+│       ├── py.typed            # required; uv init --lib creates it
+│       ├── protocols.py        # Action, Store, Driver, Rng
+│       ├── actions.py          # BaseAction, ActionState
+│       ├── rng.py              # counter-based streams
+│       ├── engine.py           # Simulation: the tick loop
 │       ├── drivers.py          # ManualDriver, RealtimeDriver
-│       └── stores/
-│           ├── __init__.py     # Store protocol
-│           └── memory.py       # in-memory reference implementation
+│       ├── stores/
+│       │   ├── __init__.py     # Store protocol
+│       │   └── memory.py       # in-memory reference implementation
+│       └── events/             # LAYER 2 — optional, added after layer 1
 ├── examples/
 │   └── tinyworld/              # smallest possible ZPG proving the API
 └── tests/
 ```
 
-Notes on the layout:
+- **`src/` layout**, not flat. Prevents accidentally importing from the
+  working directory instead of the installed package — a classic source
+  of "works on my machine" test results.
+- **`stores/postgres.py` deliberately absent.** It belongs in an optional
+  extra (`foliot[postgres]`) or a separate distribution, so the base
+  install stays dependency-free.
+- **`examples/tinyworld` is load-bearing, not decoration.** It is the only
+  honest test of whether the public API is pleasant, and it should be
+  written early enough to still change the API.
 
-- **`src/` layout**, not a flat package. It prevents accidentally
-  importing from the working directory instead of the installed
-  package, which is a classic source of "works on my machine" test
-  results.
-- **`stores/postgres.py` deliberately absent from the core.** It belongs
-  in an optional extra (`foliot[postgres]`) or a separate distribution,
-  so the base install stays dependency-free. See §17.
-- **`examples/tinyworld`** is load-bearing, not decoration. It is the
-  only honest test of whether the public API is pleasant to use, and it
-  should be written early enough to still change the API.
+### 12.2 Tooling — **DECIDED**
 
-**Tooling: `uv` for everything — DECIDED.** Environment, dependencies,
-running, building and publishing all go through `uv`; no bare `pip`, no
-manually managed venv. `uv init --lib` produces the `src/` layout above.
-Day-to-day: `uv sync`, `uv add --dev pytest ruff mypy`, `uv run pytest`.
-Packaging: `uv build` then `uv publish` (see §17 on Trusted Publishing —
-prefer the GitHub Action over publishing from a laptop). `uv.lock` is
-committed. `uv` moves quickly, so verify current command syntax against
-its docs rather than trusting this paragraph.
+**`uv` for everything.** No bare `pip`, no hand-rolled venv. `uv sync`,
+`uv add`, `uv run`, `uv build`, `uv publish`. `uv.lock` is committed. uv
+moves fast — verify syntax against its docs rather than trusting this
+paragraph.
 
-Python 3.11+ (the drafted protocols use `slots=True` and PEP 604
-unions), plus `pytest`, `ruff`, and `mypy --strict` on `src/`. Strict
-typing is worth it here specifically because the whole design is
-Protocol-based, and Protocols with no type checker are just comments.
+Python 3.11+, `pytest`, `ruff`, `mypy --strict` on `src/`. Strict typing
+is not optional: the design is Protocol-based, and Protocols without a
+type checker are just comments.
 
----
+**Verified during this session** (uv 0.8.17; current is 0.12.x, and
+nothing relevant changed):
 
-## 11. Build order
-
-Sequenced so that each milestone is independently testable and nothing
-is blocked on an unresolved question until it has to be.
-
-| # | Milestone | Depends on | Notes |
-|---|---|---|---|
-| M0 | Repo scaffold, `pyproject.toml`, lint/type/test config | — | |
-| M1 | `protocols.py` | owner's new ideas | **Do not copy the draft.** §16 is reference only; the owner has revisions to discuss first. |
-| M2 | `rng.py` — per-entity streams, `geometric`, sampled waits | §5.2 decision | Argue the RNG question first. |
-| M3 | In-memory store + queue semantics | M1 | `due_tick` buckets, tombstoning, `seq` ordering. |
-| M4 | Registry + tick pipeline (decide → group → resolve → apply) | **§8.1 rendezvous** | The core of the thing. Blocked. |
-| M5 | `ManualDriver`, then `RealtimeDriver` | §3.3 catch-up policy | Manual first — it is what makes M4 testable. |
-| M6 | `examples/tinyworld` | M4, M5 | Written while the API can still change. |
-| M7 | Postgres store as an extra | M3, §3.4, §4.4 | `SKIP LOCKED`, idempotency, `current_tick` persistence. |
-
-**Build M5's `ManualDriver` before `RealtimeDriver`.** The manual driver
-is not a testing afterthought; it is the thing that lets the whole
-pipeline be exercised at millions of ticks per second in CI. Writing the
-realtime driver first tends to produce a design where time is implicit,
-and that is very hard to back out of.
-
-**Definition of done for v0.1:**
-
-1. `examples/tinyworld` runs one million ticks under `ManualDriver` and
-   produces a byte-identical log across two runs with the same seed.
-2. Shuffling the processing order of same-tick actions does not change
-   the outcome (see §12).
-3. `RealtimeDriver` sustains a stable tick rate for an hour with no
-   measurable drift.
-4. With the Postgres store, killing the process mid-tick and restarting
-   loses no pending events and duplicates no applied effects.
-
-Items 2 and 4 are the ones worth writing first and the ones most likely
-to expose a design error rather than a coding error.
-
----
-
-## 12. Testing strategy
-
-Four tests carry most of the design's weight. They are worth writing
-early, because each one fails for *architectural* reasons rather than
-implementation reasons.
-
-**1. Replay determinism.** Run N ticks from seed S, hash the ordered
-log. Re-run identically. Assert the hashes match. This is the test that
-protects the ability to answer "why did my character die at tick 4.2
-million."
-
-**2. Order independence.** Take a tick with several due actions, process
-them in a deliberately shuffled order, and assert the resulting world
-state and log are identical. This is the *only* real test of the
-decide/apply split (§5.1), and it is what a global RNG (§5.2) would
-break. If this test cannot pass, the design has a hole in it.
-
-**3. Sampled-wait distribution.** Property test: `geometric(p)` sampled
-many times should match a naive per-tick Bernoulli simulation. Compare
-mean against `1/p` within tolerance, and ideally run a KS or chi-square
-comparison against the naive loop. This is what justifies the claim in
-§4.2 that the optimisation is exact rather than approximate — worth
-proving rather than asserting.
-
-**4. Crash recovery.** With the Postgres store, interrupt between "the
-resolver ran" and "the action was marked done," restart, and assert no
-event is lost and no effect is applied twice. This validates the
-idempotency strategy from §4.4.
-
-Beyond those: unit-test deciders and resolvers as plain functions with a
-fake context and a stub world, asserting on returned `Intent`s and
-`Outcome`s. That is the entire point of the handler contract in §7.5 —
-if a handler cannot be tested that way, the contract has been violated
-somewhere.
-
-For the clock, inject a fake time source rather than sleeping. Drift
-(§3.2) is testable by asserting that tick *n* targets
-`start + n * duration`, with no real time elapsed.
-
----
-
-## 13. Postgres schema sketch
-
-A sketch to argue with, not a migration. Deliberately minimal, and
-deliberately not including anything game-shaped.
-
-```sql
--- The queue. Source of truth; memory is a near-horizon cache (§4.4).
-CREATE TABLE scheduled_action (
-    id          BIGSERIAL PRIMARY KEY,
-    entity_id   TEXT        NOT NULL,
-    kind        TEXT        NOT NULL,
-    due_tick    BIGINT      NOT NULL,
-    payload     JSONB       NOT NULL DEFAULT '{}',
-    status      TEXT        NOT NULL DEFAULT 'pending',
-    seq         INTEGER     NOT NULL DEFAULT 0,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- The scheduler's hot path: everything due at or before tick N.
-CREATE INDEX scheduled_action_due
-    ON scheduled_action (due_tick, seq, id)
-    WHERE status = 'pending';
-
--- Cancelling every pending action for one entity (§4.3 tombstoning).
-CREATE INDEX scheduled_action_entity
-    ON scheduled_action (entity_id)
-    WHERE status = 'pending';
-
--- World clock. Single row. Must survive restart (§3.4).
-CREATE TABLE world_state (
-    id           SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    current_tick BIGINT      NOT NULL,
-    world_seed   BIGINT      NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+```
+uv init --lib
+uv add --dev pytest ruff mypy
 ```
 
-Claim pattern for the worker:
+`uv init --lib` in a non-empty git repo leaves `README.md`, `LICENSE`,
+`CLAUDE.md` and `docs/` untouched, and adds exactly:
 
-```sql
-SELECT * FROM scheduled_action
-WHERE status = 'pending' AND due_tick <= $1
-ORDER BY due_tick, seq, id
-FOR UPDATE SKIP LOCKED
-LIMIT $2;
+```
+pyproject.toml
+.python-version
+src/foliot/__init__.py     (a stub hello() to be replaced)
+src/foliot/py.typed        (empty, required, free)
 ```
 
-`SKIP LOCKED` is not needed for a single worker but costs nothing, and
-adopting it now means adding a second worker later is a config change
-rather than a redesign.
+Two things to check in the generated `pyproject.toml`:
 
-**Open, tied to §8.1:** whether an `event` table is needed at all. If
-the rendezvous mechanism is symmetric derivation, events are ephemeral
-per-tick bundles and never touch the database. If it is an explicit
-event entity, they need persistence, a lifetime, and something that
-closes them.
+- **`requires-python`** is set from whichever Python uv found. On a 3.13
+  machine it writes `>=3.13`, which would lock out 3.11 and 3.12 users.
+  We want `>=3.11`.
+- **`authors`** is guessed from git config.
 
-**Not yet designed:** the log/journal table. It matters more than usual
-here because in a ZPG the log is the product, and it will be the largest
-table by a wide margin. Partitioning by tick range is the obvious move,
-but it should be designed deliberately rather than grown.
+`uv add --dev` puts tools in a dependency group, **not** in
+`dependencies`, so `dependencies = []` stays empty. Someone doing
+`pip install foliot` gets zero transitive packages; only contributors
+running `uv sync` get pytest and friends. That is the zero-dependency
+promise, mechanically enforced.
 
----
+Ship `src/foliot/py.typed` or consumers get no type information at all.
 
-## 14. Glossary
-
-Terms as used throughout, since several are overloaded elsewhere.
-
-| Term | Meaning here |
-|---|---|
-| **Tick** | One discrete step of world time. ~1 real second, configurable. Monotonic integer. |
-| **Action** | A scheduled intention-to-decide, owned by one entity, stored in the queue. Pure data; behaviour is looked up by `kind`. |
-| **Decider** | `(ctx, action) -> [Intent]`. Reads a frozen world. Never mutates. |
-| **Intent** | What an entity wants to do, before anyone knows whether it succeeds. |
-| **`event_key`** | The grouping key. Intents sharing one in the same tick are resolved together. The rendezvous mechanism (§8.1). |
-| **Event** | A bundle of intents sharing an `event_key`, resolved as one unit. |
-| **Resolver** | `(ctx, event) -> Outcome`. Decides what actually happened. Describes mutations; does not perform them. |
-| **Effect** | A game-defined mutation object with `apply(world)`. The only thing permitted to write. |
-| **Outcome** | A resolver's full product: effects, schedules, cancels, log. |
-| **Tombstone** | Marking a pending action cancelled rather than deleting it (§4.3). |
-| **Driver** | The thing that advances the clock. Realtime (sleeps) or manual (instant). |
-| **Observer** | The player. Reads the log; cannot act. |
-
----
-
-## 15. Working notes
-
-Observations about how the owner works, recorded because they materially
-affect how to be useful here.
-
-- **Expects to be argued with, and argues back.** Several of the better
-  decisions in this document came out of push-back — the forest
-  encounter objection in §4.1 is a good example, where the objection was
-  half-right and forced a better answer than either starting position.
-  Do not simply defer; do not steamroll either.
-- **Wants mechanisms explained, not just recommended.** When something
-  was asserted without a reason (the clock drift point in §3.3), the
-  response was "I didn't understand" rather than acceptance. Explain the
-  *why*, concretely, with numbers where numbers exist.
-- **Enforces scope.** Explicitly cut off a tangent into item identity
-  and enchantments (§6.3). The instruction was to build the core with
-  nothing tied to a specific game. Respect it — game-domain modelling is
-  a later project.
-- **Strong on Python and Postgres; new to authoring libraries.** The
-  library-shaped concerns in §17 are the genuinely unfamiliar part and
-  worth being explicit about. The Python and SQL are not.
-- **Building this for enjoyment.** It is a hobby project, unrelated to
-  work, with no commercial goal. Optimise for the design being
-  interesting and the code being pleasant to write, not for shipping
-  speed.
-
----
-
-## 16. Appendix: `protocols.py` — REFERENCE DRAFT, NOT THE PLAN
-
-> **Read this as a sketch of one possible shape, not as the design.** The
-> owner has explicitly said this should be *reference material* and has
-> new ideas that supersede parts of it. Do not copy this file into
-> `src/foliot/`. Discuss the revisions first, then write the real thing.
-> It lives at `docs/reference/protocols-draft.py`, deliberately
-> hyphenated so it cannot be imported by accident.
-
-What it is useful for: the *vocabulary* (§14), the pipeline shape
-(§7.2), and the rationale in the docstrings — especially why effects are
-objects, why actions carry `seq`, and why `World` must present a stable
-per-tick view. Those arguments survive even if every signature changes.
-
-The package name in the drafted file was `simcore`, a placeholder now
-superseded by `foliot` (§9). Python 3.11+ (uses `slots=True` on
-dataclasses and PEP 604 unions).
-
-```python
-"""Core contracts for the simulation engine.
-
-Nothing in this module knows what a character, a forest, or hit points are.
-It knows about ticks, scheduled actions, intents, and resolution. A game
-supplies meaning by registering deciders and resolvers and by implementing
-Effect / World.
-
-Pipeline for a single tick:
-
-    queue.due(tick)                -> [Action]
-      for each action: decide()    -> [Intent]        (reads frozen state)
-      group intents by event_key   -> [Event]
-      for each event: resolve()    -> Outcome         (the only writer)
-      apply effects, enqueue schedules, tombstone cancels
-
-The decide phase never mutates. The resolve phase never reads anything it
-was not handed. That split is what makes ticks order-independent.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
-
-__all__ = [
-    "Tick",
-    "EntityId",
-    "ActionId",
-    "Entity",
-    "World",
-    "ActionStatus",
-    "Action",
-    "Intent",
-    "Event",
-    "Effect",
-    "Schedule",
-    "Outcome",
-    "DecideContext",
-    "ResolveContext",
-    "Decider",
-    "Resolver",
-    "Rng",
-]
-
-Tick = int
-EntityId = str
-ActionId = str
-
-
-# --------------------------------------------------------------------------
-# World
-# --------------------------------------------------------------------------
-
-@runtime_checkable
-class Entity(Protocol):
-    """Deliberately almost empty.
-
-    The engine only ever needs to identify an entity, never to interpret it.
-    Games subclass or ignore this as they like; level, hp, inventory and the
-    rest are none of the engine's business.
-    """
-
-    @property
-    def id(self) -> EntityId: ...
-
-
-class World(Protocol):
-    """Read access to game state, as seen during a single tick.
-
-    Implementations are expected to present a *stable* view for the duration
-    of a tick's decide phase: two deciders in the same tick must observe the
-    same world, regardless of processing order. How that is achieved
-    (snapshot, copy-on-write, MVCC transaction) is the implementation's
-    problem.
-    """
-
-    def get(self, entity_id: EntityId, /) -> Entity | None: ...
-
-
-class Effect(Protocol):
-    """A game-defined mutation, produced by a resolver.
-
-    Effects are the only thing permitted to write. Keeping them as objects
-    rather than inline mutation buys three things: resolvers stay pure and
-    unit-testable, effects can be logged as an audit trail of why state
-    changed, and application order is explicit rather than incidental.
-    """
-
-    def apply(self, world: Any, /) -> None: ...
-
-
-# --------------------------------------------------------------------------
-# Actions -- the unit the queue stores
-# --------------------------------------------------------------------------
-
-class ActionStatus(str, Enum):
-    PENDING = "pending"
-    DONE = "done"
-    CANCELLED = "cancelled"  # tombstone; skipped on pop
-
-
-@dataclass(frozen=True, slots=True)
-class Action:
-    """A scheduled intention-to-decide, owned by one entity.
-
-    Data only, no behaviour: `kind` is looked up in the decider registry.
-    That keeps actions trivially serialisable, which is what lets the queue
-    live in Postgres instead of in process memory.
-
-    An entity may have many pending actions at once -- a sampled encounter,
-    an arrival, a cooldown expiry -- so this is a separate record keyed by
-    entity, never a field on the entity itself.
-    """
-
-    id: ActionId
-    entity_id: EntityId
-    kind: str
-    due_tick: Tick
-    payload: Mapping[str, Any] = field(default_factory=dict)
-    status: ActionStatus = ActionStatus.PENDING
-
-    # Tie-break within a tick. Ordering must be total and deterministic even
-    # though resolution is order-independent, so that replays match exactly.
-    seq: int = 0
-
-    def sort_key(self) -> tuple[Tick, int, ActionId]:
-        return (self.due_tick, self.seq, self.id)
-
-
-# --------------------------------------------------------------------------
-# Intents and events -- the rendezvous layer
-# --------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class Intent:
-    """What an entity wants to do, before anyone knows if it succeeds.
-
-    `event_key` is the whole grouping mechanism. Intents emitted in the same
-    tick sharing a key are bundled into one Event and resolved together;
-    that is how a character's "swing at the beast" and the beast's "bite the
-    character" become a single fight rather than two independent
-    resolutions.
-
-    Solo intents leave `event_key` unset and get a unique one, which makes a
-    single-participant event -- no special case in the engine.
-    """
-
-    actor_id: EntityId
-    kind: str
-    event_kind: str
-    event_key: str | None = None
-    payload: Mapping[str, Any] = field(default_factory=dict)
-
-    # The action this intent came from, so a resolver can tombstone the
-    # losing branch (encounter fired first, so cancel the arrival).
-    source_action_id: ActionId | None = None
-
-    def resolved_key(self) -> str:
-        if self.event_key is not None:
-            return self.event_key
-        return f"solo:{self.event_kind}:{self.actor_id}:{self.kind}"
-
-
-@dataclass(frozen=True, slots=True)
-class Event:
-    """A group of intents to be resolved as one unit."""
-
-    key: str
-    kind: str
-    tick: Tick
-    intents: tuple[Intent, ...]
-
-    @property
-    def participants(self) -> tuple[EntityId, ...]:
-        seen: dict[EntityId, None] = {}
-        for i in self.intents:
-            seen.setdefault(i.actor_id, None)
-        return tuple(seen)
-
-
-@dataclass(frozen=True, slots=True)
-class Schedule:
-    """A request to enqueue a future action."""
-
-    entity_id: EntityId
-    kind: str
-    due_tick: Tick
-    payload: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class Outcome:
-    """Everything a resolver produces. No side effects, just a description.
-
-    `log` carries observer-facing narrative. In a zero-player game the log
-    *is* the product, so it is a first-class output rather than something
-    scraped out of effects afterwards.
-    """
-
-    effects: tuple[Effect, ...] = ()
-    schedules: tuple[Schedule, ...] = ()
-    cancels: tuple[ActionId, ...] = ()
-    log: tuple[Any, ...] = ()
-
-
-# --------------------------------------------------------------------------
-# Contexts and handler signatures
-# --------------------------------------------------------------------------
-
-class Rng(Protocol):
-    """Per-entity, per-tick randomness. Never the global `random` module.
-
-    Seeded from (world_seed, entity_id, tick, seq) so that outcomes do not
-    depend on processing order -- which is what permits parallel workers,
-    handler retries, and replaying a single character's tick years later to
-    answer "why did my hero die here".
-
-    The sampled waits matter as much as the raw draws: `geometric` turns
-    "roll 1% every tick" into one scheduled event instead of thousands of
-    no-op wakeups, with an identical distribution.
-    """
-
-    def random(self) -> float: ...
-    def randint(self, lo: int, hi: int) -> int: ...
-    def choice(self, seq: Iterable[Any], /) -> Any: ...
-    def geometric(self, p: float) -> int: ...
-
-
-class DecideContext(Protocol):
-    """Handed to a decider. Read-only by construction."""
-
-    @property
-    def tick(self) -> Tick: ...
-    @property
-    def world(self) -> World: ...
-    @property
-    def rng(self) -> Rng: ...
-
-
-class ResolveContext(Protocol):
-    """Handed to a resolver.
-
-    Still read-only: resolvers describe mutations as Effects rather than
-    performing them, so they can be called in a test with a fake world and
-    asserted on by return value.
-    """
-
-    @property
-    def tick(self) -> Tick: ...
-    @property
-    def world(self) -> World: ...
-    @property
-    def rng(self) -> Rng: ...
-
-
-class Decider(Protocol):
-    """Action -> intents. Registered against `Action.kind`."""
-
-    def __call__(
-        self, ctx: DecideContext, action: Action, /
-    ) -> Iterable[Intent]: ...
-
-
-class Resolver(Protocol):
-    """Event -> outcome. Registered against `Intent.event_kind`.
-
-    Resolvers must re-validate participants: between decide and resolve, a
-    participant may have died in another event this same tick. Degrade,
-    do not assume.
-    """
-
-    def __call__(self, ctx: ResolveContext, event: Event, /) -> Outcome: ...
-```
-
----
-
-## 17. Library hygiene notes
+### 12.3 Library hygiene
 
 Collected because the owner has not shipped a library before. Small
 conventions, but they are the difference between a library and a project
@@ -1228,15 +1097,215 @@ folder:
   consuming application configure handlers.
 - No side effects at import time.
 - No reading config files from disk. Configuration is passed in.
-- Dependencies list should be essentially empty. Postgres support goes
-  in an extras group or a separate distribution.
+- Dependencies list stays empty. Postgres support goes in an extras group
+  or a separate distribution.
 - Persistence, clock driving, and randomness are all **injected
-  interfaces**, not concrete implementations. The in-memory
-  implementations that ship with the library exist primarily so tests
-  and quickstarts work without a database.
-- Test the engine with `ManualDriver` and an in-memory store; those two
-  together should let the full pipeline run millions of ticks in a
-  test suite.
+  interfaces**. The in-memory implementations that ship exist primarily
+  so tests and quickstarts work without a database.
+
+---
+
+## 13. Build order
+
+Sequenced so each milestone is independently testable.
+
+| # | Milestone | Depends on | Notes |
+|---|---|---|---|
+| M0 | Repo scaffold, `pyproject.toml`, lint/type/test config | — | `uv init --lib`; verify toolchain on the empty package. |
+| M1 | `protocols.py` — `Action`, `Store`, `Driver`, `Rng` | §3, §7 | Written fresh. The v1 draft is reference only. |
+| M2 | `actions.py` — `BaseAction`, `ActionState`, suspend/resume | M1, §6 | `remaining` bookkeeping lives here so games never write it. |
+| M3 | `rng.py` — counter-based streams, stable hashing | §9 | Watch `PYTHONHASHSEED` (§9.4). |
+| M4 | `stores/memory.py` — queue semantics | M1, M2 | `due_tick` buckets, tombstoning, `seq` ordering, no-op transaction. |
+| M5 | `engine.py` + `ManualDriver` | M1–M4, §8 | The tick loop and the transaction boundary. |
+| M6 | `RealtimeDriver` | §4.3 catch-up policy | Manual first — it is what makes M5 testable. |
+| M7 | `examples/tinyworld` | M5 | Written while the API can still change. |
+| M8 | Layer 2: `events/` — intents, grouping, resolvers | M5, §10 | Optional module. Layer 1 must work without it. |
+| M9 | Postgres store as an extra | M4, §4.4, §8 | `encode`/`decode`, `SKIP LOCKED`, `current_tick`. |
+
+**Build `ManualDriver` before `RealtimeDriver`.** The manual driver is
+not a testing afterthought; it is what lets the whole pipeline be
+exercised at millions of ticks per second in CI. Writing the realtime
+driver first tends to produce a design where time is implicit, and that
+is very hard to back out of.
+
+**Definition of done for v0.1:**
+
+1. `examples/tinyworld` runs one million ticks under `ManualDriver` and
+   produces a byte-identical log across two runs with the same seed.
+2. Shuffling the processing order of same-tick actions does not change
+   the outcome.
+3. `RealtimeDriver` sustains a stable tick rate for an hour with no
+   measurable drift.
+4. With the Postgres store, killing the process mid-tick and restarting
+   loses no pending events and duplicates no applied effects.
+
+Items 2 and 4 are worth writing first and are the ones most likely to
+expose a design error rather than a coding error.
+
+---
+
+## 14. Testing strategy
+
+Four tests carry most of the design's weight. Each fails for
+*architectural* rather than implementation reasons.
+
+**1. Replay determinism.** Run N ticks from seed S, hash the ordered log.
+Re-run identically. Assert the hashes match. This protects the ability to
+answer "why did my character die at tick 4.2 million." **Run it in a
+subprocess with a different `PYTHONHASHSEED`** — that is what catches
+§9.4.
+
+**2. Order independence.** Take a tick with several due actions, process
+them in a deliberately shuffled order, and assert the resulting world
+state and log are identical. This is the only real test of the guarantee
+in §2, and it is what a global RNG would break. If this cannot pass, the
+design has a hole in it.
+
+**3. Suspend/resume fidelity.** Suspend an activity group mid-flight,
+advance many ticks, resume, and assert the remaining duration is
+preserved exactly — while ungrouped effects (poison, hunger) fired
+throughout. This is the test for §6.
+
+**4. Crash recovery.** With the Postgres store, interrupt between "the
+handler ran" and "the tick committed," restart, and assert no event is
+lost and no effect is applied twice. This validates §8.
+
+Beyond those: unit-test handlers as plain functions with a fake context
+and a stub world. That is the entire point of §7.4 — if a handler cannot
+be tested that way, the contract has been violated.
+
+For the clock, inject a fake time source rather than sleeping. Drift
+(§4.1) is testable by asserting that tick *n* targets
+`start + n * duration`, with no real time elapsed.
+
+If sampled waits are ever revisited, add: **sampled-wait distribution** —
+property-test `geometric(p)` against a naive per-tick Bernoulli loop,
+comparing the mean against `1/p` and ideally running a KS or chi-square
+comparison.
+
+---
+
+## 15. Postgres notes
+
+A sketch to argue with, not a migration. Deliberately minimal and
+deliberately not game-shaped. Lives in the extra, not the core.
+
+```sql
+-- The queue. Source of truth; memory is a near-horizon cache.
+CREATE TABLE scheduled_action (
+    id          BIGSERIAL PRIMARY KEY,
+    entity_id   TEXT        NOT NULL,
+    kind        TEXT        NOT NULL,   -- from encode(); see §7.3
+    payload     JSONB       NOT NULL DEFAULT '{}',
+    due_tick    BIGINT      NOT NULL,
+    group_id    TEXT,                   -- activity bundle; §6.2
+    status      TEXT        NOT NULL DEFAULT 'active',
+    remaining   BIGINT,                 -- meaningful when suspended; §5.3
+    seq         INTEGER     NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The scheduler's hot path: everything due at or before tick N.
+CREATE INDEX scheduled_action_due
+    ON scheduled_action (due_tick, seq, id)
+    WHERE status = 'active';
+
+-- Suspending or cancelling a whole activity at once (§6.2).
+CREATE INDEX scheduled_action_group
+    ON scheduled_action (group_id)
+    WHERE status = 'active';
+
+-- World clock. Single row. Must survive restart (§4.4).
+CREATE TABLE world_state (
+    id           SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    current_tick BIGINT      NOT NULL,
+    world_seed   BIGINT      NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Claim pattern for a worker:
+
+```sql
+SELECT * FROM scheduled_action
+WHERE status = 'active' AND due_tick <= $1
+ORDER BY due_tick, seq, id
+FOR UPDATE SKIP LOCKED
+LIMIT $2;
+```
+
+`SKIP LOCKED` is unnecessary for a single worker but costs nothing, and
+adopting it now makes a second worker a config change rather than a
+redesign.
+
+**An `event` table is needed** — §10.2 settled that events are persisted,
+with identity and lifetime. Something must close them.
+
+**Still not designed: the log/journal table.** It matters more than usual
+here because in a ZPG the log is the product, and it will be the largest
+table by a wide margin. Partitioning by tick range is the obvious move,
+but it should be designed deliberately rather than grown. **OPEN.**
+
+One note carried from this session's discussion: intents and applied
+effects should **not** share a table with `scheduled_action`. The queue's
+hot query runs every tick forever and its pending set stays roughly
+proportional to the number of live Chars; history grows without bound. Put
+history in the journal, keep the queue small and hot.
+
+---
+
+## 16. Glossary
+
+| Term | Meaning here |
+|---|---|
+| **Tick** | One discrete step of world time. ~1 real second, configurable. Monotonic integer. |
+| **Action** | A scheduled unit of work owned by one entity, with a `process()` method. Stored in the queue. |
+| **`due_tick`** | The absolute tick at which an action becomes due. The queue's primitive. |
+| **`remaining`** | Ticks left in an action. Rides along while active; the sole record while suspended. |
+| **`group_id`** | Opaque activity bundle. Suspension operates on it. The engine never interprets it. |
+| **Activity** | A bundle of actions sharing a `group_id` — one narrative beat. Game concept. |
+| **Effect (game sense)** | Poison, hunger, cooldowns — actions belonging to no group, which tick through suspension. |
+| **Effect (layer 2)** | A mutation object with `apply(world)`. The only thing permitted to write. |
+| **Driver** | The thing that advances the clock. `RealtimeDriver` sleeps; `ManualDriver` does not. |
+| **Store** | The consumer's persistence adapter: `current_tick`, `due`, `tick_transaction`. |
+| **Tick transaction** | The atomicity boundary. Everything in tick N lands together or not at all. |
+| **Tombstone** | Marking an action cancelled rather than deleting it. |
+| **Intent** | *(Layer 2)* What an entity wants to do, before anyone knows whether it succeeds. |
+| **Event** | *(Layer 2)* A bundle of intents resolved as one unit. Persisted; has a lifetime. |
+| **Resolver** | *(Layer 2)* `(ctx, event) -> Outcome`. Decides what actually happened. |
+| **First-order producer** | *(Game)* A Char. Persists independently; schedules its own actions. |
+| **Second-order producer** | *(Game)* A wolf. Spawned by an environment; exists only inside an event. |
+| **Observer** | The player. Reads the log; cannot act. |
+
+---
+
+## 17. Working notes
+
+How the owner works. Recorded because it materially affects how to be
+useful here.
+
+- **Expects to be argued with, and argues back.** Several of the better
+  decisions came out of push-back — the per-tick-rolling reversal (§5.4)
+  is the clearest example, where the owner's objection overturned a
+  recommendation this document had previously made. Do not simply defer;
+  do not steamroll either.
+- **Wants mechanisms explained, not just recommended.** "I didn't
+  understand" is a normal and useful response here, and the right answer
+  to it is a concrete worked example — a benchmark table, a two-fight
+  RNG trace, a `pickle` failure demonstrated rather than described — not
+  a restatement. Abstract arguments have repeatedly failed where a
+  ten-line runnable example landed immediately.
+- **Enforces scope.** Game-domain modelling (item identity, enchantments)
+  was explicitly cut off. Respect it.
+- **Strong on Python and Postgres; new to authoring libraries.** The
+  library-shaped concerns in §12.3 are the genuinely unfamiliar part.
+  The Python and SQL are not.
+- **Runs the commands themselves.** For `uv init`, `uv add` and similar,
+  say what to run and why; do not run it for them. File edits are fine to
+  do directly.
+- **Building this for enjoyment.** Optimise for the design being
+  interesting and the code being pleasant to write, not for shipping
+  speed.
 
 ---
 
@@ -1244,63 +1313,101 @@ folder:
 
 ### Decided
 
-- Two projects: domain-agnostic core library + ZPG game consuming it.
-- Continuous simulation (not lazy materialisation).
-- Tick-based, ~1s ticks, tick duration configurable.
-- Python / PostgreSQL / Flask-or-FastAPI.
-- Two-tier entity model (`entity` slow-changing, `entity_state`
-  fast-changing).
-- Two-phase tick: decide (pure, frozen snapshot) then resolve/apply.
-- Multi-participant interactions resolve inside a shared Event with
-  intents locked in first.
-- Core library scope only for now; no game-domain modelling.
-- Library is named **`foliot`** (§9).
+**Simulation model**
 
-### Recommended and explained, not explicitly confirmed
+- Continuous simulation; tick-based; ~1s ticks; duration configurable.
+- Per-character isolation is the property to optimise for, not throughput.
+- Two-tier entity state (slow `entity` / fast `entity_state`).
 
-- Absolute-deadline clock rather than relative sleeps.
-- Arbitrary-future-tick scheduling (timing wheel) rather than N+1 only.
-- Sampled waits (geometric) replacing per-tick rolls.
-- Durable Postgres queue with in-memory near-horizon cache;
-  `FOR UPDATE SKIP LOCKED`; tombstoning.
-- Queue as its own table rather than a `current_action` field.
-- Per-entity RNG streams seeded on `(world_seed, entity_id, tick, seq)`.
-- Effects as objects; `log` as a first-class `Outcome` field.
-- Pluggable clock drivers (`RealtimeDriver` / `ManualDriver`).
+**Core shape**
+
+- foliot is defined by its five guarantees (§2), not by its object graph.
+- The core/game line, with the "does the engine read it?" test (§3).
+  `target` is game payload, not a core field.
+- Two layers; layer 1 must be usable without layer 2 (§10.1).
+- Absolute-deadline clock (§4.1); pluggable drivers (§4.2).
+
+**Queue**
+
+- `due_tick` is the primitive; per-tick is `due_tick = now + 1` (§5.1).
+- Deadlines, not countdowns; `expires_at` in payload (§5.2).
+- `remaining` on `ActionState`, meaningful in both active and suspended
+  (§5.3).
+- Per-tick rolling is the default; sampled waits are available but not
+  the pattern (§5.4).
+- Tombstoning, not removal (§5.5).
+
+**Suspension**
+
+- Ungrouped effects tick through suspension; activities suspend as a
+  bundle via opaque `group_id` (§6.2).
+- `BaseAction` owns suspend/resume so games never write it (§6.4).
+- Action granularity: the activity is the narrative beat (§6.3).
+
+**Actions and persistence**
+
+- `Action` is an object with `process()`; Protocol for the contract,
+  `BaseAction` for bookkeeping (§7.1, §7.2).
+- Serialisation is the store's problem; `encode`/`decode` supplied by the
+  consumer only when durability is wanted (§7.3).
+- The tick is the transaction; the library owns *when*, the game owns
+  *how* and *where* (§8).
+- Idempotency question closed by tick-atomicity, with the
+  effects-outside-the-transaction caveat (§8.4).
+
+**Randomness**
+
+- Per-entity, counter-based streams seeded on
+  `(world_seed, entity_id, tick, seq)`; `world_seed` from the clock at
+  world creation (§9.1).
+- Stable hashing, never `hash()` on strings (§9.4).
+- Deterministic ids for ephemeral entities (§9.5).
+
+**Layer 2**
+
+- Rendezvous resolved: environments open events; `Event` is persisted
+  (§10.2).
+- No reaction pass needed (§10.3).
+- Effects as objects; `log` as a first-class `Outcome` field (§10.4).
+
+**Project**
+
+- Library named `foliot`; `uv` for everything; Python 3.11+;
+  `mypy --strict` on `src/`.
 
 ### Open, needs deciding
 
-1. **Rendezvous mechanism** (§8.1) — symmetric key derivation vs.
-   explicit persisted event entity. **Blocks the registry.** Determines
-   whether `Event` is persisted or ephemeral.
-2. **Catch-up policy** (§3.3) — pin world time to wall time vs. allow
-   lag. Leaks into the loop structure.
-3. **Downtime handling** (§3.4) — fast-forward, compress, or shift the
+1. **Catch-up policy** (§4.3) — pin world time to wall time vs. allow
+   lag. Not blocking until `RealtimeDriver` (M6).
+2. **Downtime handling** (§4.4) — fast-forward, compress, or shift the
    world clock.
-4. **Idempotency strategy** (§4.4) — idempotent handlers vs. fully
-   transactional effect+status application.
-5. **Per-entity RNG** (§5.2) — recommendation stands, owner's initial
-   preference was a global RNG; likely resolved by clarification but not
-   confirmed.
-6. **Action granularity** — is one action roughly one narrative beat the
-   observer reads, or finer-grained than what gets surfaced? Asked but
-   not answered.
-7. **Log/journal table design** (§13) — not yet designed. It will be the
-   largest table by a wide margin and it *is* the product, so it wants
-   deliberate design (partitioning by tick range) rather than organic
-   growth.
-8. Flask vs. FastAPI. Deferrable indefinitely, and irrelevant to the
+3. **Log/journal table design** (§15) — the largest table, and it *is*
+   the product. Wants deliberate design.
+4. **Flask vs. FastAPI** — deferrable indefinitely; irrelevant to the
    library.
 
 ### Immediate next work
 
-Full sequence in **§11 Build order**. The short version: scaffold the
-repo (M0), then design the real protocols with the owner (M1) — the §16
-draft is reference material, not code to copy, and the owner has
-revisions to it. Then settle the
-**rendezvous question (§8.1)** before writing the registry and tick loop
-(M4), since it determines whether `Event` needs persistence and
-therefore what the schema looks like.
+M0: `uv init --lib` and `uv add --dev pytest ruff mypy`, then metadata
+and tool config, then verify the toolchain on the empty package. Then M1.
 
-Settle the **RNG question (§5.2)** before M2, since it is a one-line
-change now and a rewrite later.
+---
+
+## 19. Superseded: what changed from v1, and why
+
+Recorded so the old reasoning is available without being authoritative.
+Losing the reasoning is the only real cost of overwriting a document.
+
+| v1 said | v2 says | Why |
+|---|---|---|
+| **Sampled/geometric waits** replace per-tick rolls; one queue entry instead of thousands. | **Per-tick rolling is the default.** Sampled waits available, not the pattern. | Sampling is valid only while `p` is constant. `p` depends on Char *and* environment stats, which change often; resampling churn eats the savings. Per-tick is also far easier to reason about. The *ability* to schedule far ahead is kept — sleep-until-dawn needs it. |
+| **`Action` is data only**, behaviour looked up by `kind` in a registry, so it can be a Postgres row. | **`Action` is an object with `process()`.** | The library is a set of interfaces; an object is the natural shape. The serialisation concern is real but belongs to the *store*, via a consumer-supplied `encode`/`decode` pair, and does not exist at all for the in-memory store. |
+| **`target` should be a first-class core field** (argued mid-session), driving event-key derivation and cascade cancels. | **`target` is game payload.** | The engine never reads it. Environments open events explicitly, so no key derivation is needed. Fails the "does the engine read it?" test. |
+| **Rendezvous (§8.1) is unresolved and blocks the registry.** | **Resolved: Option B.** Environments open events and enrol participants; `Event` is persisted. | The game's environment-as-event-spawner design answers it directly. Option A (symmetric derivation) remains available for incidental interactions. |
+| **Per-entity RNG recommended but unconfirmed**; owner preferred a global RNG. | **Decided: per-entity, counter-based.** | The Ivan/Petra example (§9.2): a global stream couples unrelated fights through a hidden cursor, breaking per-character isolation, crash recovery and any reordering. Cost objection answered by measurement (§9.3) — 1.6% of a core. |
+| `rng = Random(hash((world_seed, entity_id, tick, seq)))` | Stable hash / integer mixing; **never `hash()` on a string.** | `hash()` is salted per process (`PYTHONHASHSEED`), so v1's snippet silently breaks replay across a restart. |
+| **Idempotency strategy is open**: idempotent handlers vs. transactional application. | **Closed.** The tick is the transaction. | With tick-atomicity there is never a half-applied tick, so idempotency is not required — except for effects that reach outside the transaction, which their authors must handle. |
+| **Action granularity is open**: is one action one narrative beat? | **Effectively answered.** The *activity* is the narrative beat; the actions inside it are machinery. | Fell out of needing a bundle handle (`group_id`) for suspension. |
+| A **reaction pass** may be needed so targeted entities can act. | **Not needed.** | The environment rolls inside the walking Char's own decide, and schedules the resulting event for the next tick. The pipeline stays single-pass. |
+| Intents/events/resolvers are **the framework layer** (core, central). | **Layer 2 — a separate, optional module.** | Layer 1 must be complete and useful alone, or foliot is a framework with a mandatory opinion rather than a library. Layer 2 still earns inclusion because it adds simultaneity. |
+| `docs/reference/protocols-draft.py` is the reference shape. | **Superseded.** Vocabulary still useful; signatures are not. | `Action` changed shape entirely (§7.1), `target` is out, and the two-layer split changes what belongs in `protocols.py`. |
