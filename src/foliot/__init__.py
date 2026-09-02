@@ -16,7 +16,15 @@ Everything re-exported here is public API: a moved name is a breaking change.
 Anything not listed in `__all__` is internal and free to move.
 """
 
-from foliot.actions import Action
+from foliot.actions import (
+    ActionBinding,
+    ActionState,
+    Active,
+    BaseAction,
+    Bound,
+    Suspended,
+    Unbound,
+)
 from foliot.context import TickContext
 from foliot.drivers import Driver
 from foliot.effects import Effect
@@ -25,14 +33,20 @@ from foliot.rng import Rng
 from foliot.stores import Store, Txn
 
 __all__ = [
-    "Action",
+    "ActionBinding",
+    "ActionState",
+    "Active",
+    "BaseAction",
+    "Bound",
     "Driver",
     "Effect",
     "EntityId",
     "Rng",
     "Store",
+    "Suspended",
     "SuspensionId",
     "Tick",
     "TickContext",
     "Txn",
+    "Unbound",
 ]

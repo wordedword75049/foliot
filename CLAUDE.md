@@ -73,8 +73,8 @@ copy. The two ideas worth having are in §10.5; the rest is in git
 
 ## Open questions — ask, do not decide
 
-Four things remain genuinely undecided. Raise them; do not settle them in
-a commit:
+Four architectural questions remain genuinely undecided. Raise them; do not
+settle them in a commit:
 
 1. **Catch-up policy** (§4.3) — pin world time to wall time, or let it
    lag. Not blocking until `RealtimeDriver` (M6).
@@ -84,7 +84,9 @@ a commit:
    the log *is* the product.
 4. **Flask vs FastAPI** — irrelevant to the library; deferrable forever.
 
-Everything else in v1's open list is now settled. See §18 and §19.
+Everything else in v1's open list is now settled. Immediate milestone-level
+interface choices may still be called out under §18's "Immediate next work";
+discuss those with the owner too. See §18 and §19.
 
 ## Tooling
 
@@ -95,8 +97,9 @@ assuming.
 
 Python 3.12+ floor, 3.14 dev interpreter, `src/` layout, `pytest`,
 `ruff`, `basedpyright` in strict mode on `src/`. Strict typing is not
-optional: the design is Protocol-based, and Protocols without a type
-checker are just comments. `# type: ignore` is disabled outright
+optional: the design uses structural ports plus a mandatory `BaseAction`,
+and neither contract is useful without a type checker. `# type: ignore` is
+disabled outright
 (`enableTypeIgnoreComments = false`) — a checker you can silence is a
 checker you will silence.
 

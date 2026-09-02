@@ -29,16 +29,20 @@ assertion is on what the context *collected*:
 ```python
 def test_poison_should_reschedule_until_it_expires():
     ctx = FakeContext(tick=100, rng=FixedRng(0.5))
-    Poison(EntityId("ivan"), seq=0, interval=3, expires_at=110).process(ctx)
+    poison = Poison(EntityId("ivan"), interval=3, expires_at=110)
+    poison.process(ctx)
 
     assert ctx.effects == [Damage(EntityId("ivan"), 3)]
-    assert ctx.schedules == [(action, 103)]
+    assert ctx.schedules == [(poison, 103)]
     assert not ctx.finished
 ```
 
 No engine, no store, no database. `FakeContext` is about ten lines and is
 written once — that ten lines is the entire cost of the collecting-context
-design over one that returned a value.
+design over one that returned a value. This direct handler test deliberately
+does not admit the new action to a store, so `poison.binding` remains
+`Unbound()`. A successful first `txn.schedule()` replaces it with
+`Bound(seq, Active(due_tick))` (§6.4).
 
 ## Fakes, not mocks
 
@@ -49,18 +53,18 @@ A fake is a hand-written class implementing the Protocol, holding seed state
 and recording what happened as ordinary attributes:
 
 ```python
-class FakeStore:
+class FakeStore[W]:
     """In-memory Store for tests. Records what the engine did to it."""
 
-    def __init__(self, queue: dict[Tick, list[Action]] | None = None) -> None:
+    def __init__(self, queue: dict[Tick, list[BaseAction[W]]] | None = None) -> None:
         self._queue = queue or {}
         self.committed: list[Tick] = []
 
     @property
     def world_seed(self) -> int: ...
     def current_tick(self) -> Tick: ...
-    def due(self, tick: Tick) -> Iterable[Action[W]]: ...
-    def tick_transaction(self, tick: Tick) -> ContextManager[Txn[W]]: ...
+    def due(self, tick: Tick) -> Iterable[BaseAction[W]]: ...
+    def tick_transaction(self, tick: Tick) -> AbstractContextManager[Txn[W]]: ...
 ```
 
 Tests then assert on `store.committed == [0, 1, 2]` — ordinary Python data,
@@ -72,7 +76,8 @@ Three reasons, in ascending order of how much they would hurt here:
    `store.due_actions()` as happily as `store.due()`. Rename a method on the
    `Store` Protocol and every mock-based test stays green while production is
    broken. A hand-written fake stops type-checking the moment the Protocol
-   changes — which is why `tests/` joins the basedpyright `include` at M1.
+   changes — which is why `tests/` joins the basedpyright `include` as soon
+   as the test tree is created after M2.
 2. **A mock returns a mock.** `due(tick)` on a `MagicMock` returns a
    `MagicMock`, which is iterable-ish and truthy. The order-independence test
    would shuffle nothing, process nothing, compare two empty worlds, and

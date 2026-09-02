@@ -13,12 +13,12 @@ is marked **(provisional)** — re-argue or delete it when the milestone lands.
 
 ## Type discipline
 
-**Ports are `typing.Protocol`, never ABC.** An ABC forces the game to
-import foliot merely to satisfy a type, which points the dependency arrow
-the wrong way; structural typing keeps `Store`, `Driver` and `Rng`
-implementable by someone who never subclasses anything. `BaseAction` is the
-single exception, and it is a *convenience* class, not a required base — the
-engine only ever type-checks against the `Action` Protocol (§7.2).
+**Ports are `typing.Protocol`, never ABC.** Structural typing keeps `Store`,
+`Driver`, `Rng`, `Effect`, and `TickContext` implementable without inheritance.
+`BaseAction` is deliberately not a port: it owns invariants the engine must
+enforce, so every game action that enters foliot's queue inherits it (§7.2).
+Making that inheritance mandatory prevents each game from reimplementing
+binding, stable `seq`, and suspension bookkeeping differently.
 
 **PEP 695 syntax throughout.** `type Tick = int`, `class Store[A](Protocol):`.
 No `TypeVar(...)` declarations, no `Generic[T]` base. The floor is 3.12
@@ -31,7 +31,7 @@ safety. Where swapping two values would be catastrophic and both are `str` —
 ```python
 type Tick = int  # alias: Tick IS int, freely swappable
 EntityId = NewType("EntityId", str)  # distinct: str is not an EntityId
-EventId = NewType("EventId", str)
+SuspensionId = NewType("SuspensionId", str)
 ```
 
 Failure mode without it: `resume_all(entity_id)` type-checks, matches no
@@ -72,10 +72,18 @@ error at every call site into a runtime crash at tick four million.
 **States carry their own fields.** `ActionState` is a discriminated union of
 frozen dataclasses, not an enum, because each state has different data:
 `Active(due_tick)` and `Suspended(suspended_at, suspended_by, due_tick)`
-(§6.4). That makes the target bug unwritable — a suspended action with no
-record of when it paused, or an active one with no deadline, will not
-type-check. `status` is a `Literal` so the value in Python *is* the value in
-the `status` column, with no mapping layer.
+(§6.4). `due_tick=None` is the complete recurring shape, not a missing
+deadline. The union makes the real target bug unwritable: a suspended action
+with no record of when it paused or who owes its wake-up does not type-check.
+`status` is a `Literal` so the value in Python *is* the value in the `status`
+column, with no mapping layer.
+
+**Binding is a separate closed union.** Every `BaseAction` contains exactly
+one `ActionBinding`: `Unbound()` before first admission, or
+`Bound(seq, state)` afterwards (§6.4). `Unbound` is not a third
+`ActionState`; it answers whether the object has entered the queue. Keeping
+`seq` and `state` together prevents the half-bound combinations that two
+independent optional attributes would permit.
 
 ## Class shape
 
@@ -86,10 +94,12 @@ the point: their base class is a dependency they already pay for.
 
 **`frozen=True, slots=True` by default.** Mutability is the exception and
 must be justified in a comment. The state classes are frozen: a transition
-*replaces* the state object rather than editing it, which is why a suspended
-action cannot hold a stale `due_tick` — the object that held one is gone.
-`BaseAction` itself is the justified exception, since `suspend()` and
-`resume()` rebind `self.state` (§6.4).
+*replaces* the state object rather than editing it. A scheduled deadline
+preserved in `Suspended` is therefore an intentional snapshot used on resume,
+not a second mutable attribute that can drift. `BaseAction` itself is the
+justified exception, since admission, rescheduling, suspension, and resumption
+replace its internal binding while preserving the game object's own fields
+(§6.4). The public `binding` property remains read-only.
 
 **`@override` on every overriding method.** `reportImplicitOverride` is an
 error. Failure mode: rename a method on `BaseAction` and a subclass's
@@ -121,7 +131,7 @@ These three are the guarantees written as lint rules. Each has a worked
 demonstration in `DESIGN_SNAPSHOT.md`.
 
 **Never `import random` outside `rng.py`.** Handlers take randomness from
-`ctx.rng` / `sim.rng` (§7.4). A module-level `random.random()` is a global
+`ctx.rng` (§7.4). A module-level `random.random()` is a global
 stream, and §9.2 traces exactly how that lets Petra's fight change whether
 Ivan lives — the coupling is a cursor position that appears in no table.
 

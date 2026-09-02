@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from typing import Protocol
 
-from foliot.actions import Action
+from foliot.actions import BaseAction
 from foliot.ids import EntityId, SuspensionId, Tick
 
 __all__ = ["Store", "Txn"]
@@ -47,11 +47,16 @@ class Txn[W](Protocol):
         """
         ...
 
-    def schedule(self, action: Action[W], due_tick: Tick | None, /) -> None:
-        """`due_tick=None` schedules a recurring action (§5.7)."""
+    def schedule(self, action: BaseAction[W], due_tick: Tick | None, /) -> None:
+        """Schedule an action, binding it on first successful admission.
+
+        `due_tick=None` makes it recurring (§5.7). A new action receives its
+        one stable `seq`; an already-bound action keeps its existing `seq` and
+        replaces only its active state (§6.4, §9.4b).
+        """
         ...
 
-    def delete(self, action: Action[W], /) -> None:
+    def delete(self, action: BaseAction[W], /) -> None:
         """Finished or invalidated actions are removed, not tombstoned (§5.5)."""
         ...
 
@@ -99,10 +104,13 @@ class Store[W](Protocol):
 
     def current_tick(self) -> Tick: ...
 
-    def due(self, tick: Tick, /) -> Iterable[Action[W]]:
+    def due(self, tick: Tick, /) -> Iterable[BaseAction[W]]:
         """Everything that should run now: rows due at `tick`, plus every
-        recurring action (§5.7). Order is not significant, and callers may
-        process the result in any order."""
+        recurring action (§5.7).
+
+        Every returned action must be `Bound`. Order is not significant, and
+        callers may process the result in any order.
+        """
         ...
 
     def tick_transaction(self, tick: Tick, /) -> AbstractContextManager[Txn[W]]: ...

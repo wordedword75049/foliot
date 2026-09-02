@@ -19,7 +19,7 @@ from foliot.ids import Tick
 from foliot.rng import Rng
 
 if TYPE_CHECKING:
-    from foliot.actions import Action
+    from foliot.actions import BaseAction
 
 __all__ = ["TickContext"]
 
@@ -57,14 +57,15 @@ class TickContext[W](Protocol):
         """Stage a change to the world. Applied after the whole loop."""
         ...
 
-    def schedule(self, action: "Action[W]", due_tick: Tick | None, /) -> None:
+    def schedule(self, action: "BaseAction[W]", due_tick: Tick | None, /) -> None:
         """Queue an action. `None` makes it recurring -- it runs every tick and
         stores no deadline, because for it the next due tick is always `now + 1`
         (§5.7).
 
-        `due_tick` must be strictly in the future. Scheduling into the current
-        tick lands in a bucket the engine has already read, so whether anything
-        else sees it depends on who ran first (§5.6). Implementations reject it.
+        A concrete `due_tick` must be strictly in the future. Scheduling into
+        the current tick lands in a bucket the engine has already read, so
+        whether anything else sees it depends on who ran first (§5.6).
+        Implementations reject it.
         """
         ...
 
