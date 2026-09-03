@@ -259,6 +259,14 @@ sim.run(RealtimeDriver(tick_seconds=1.0))  # production
 sim.run(ManualDriver(until_tick=10_000_000))  # tests, fast-forward
 ```
 
+`ManualDriver.until_tick` is **inclusive**. If the next unfinished tick is 90,
+running with `until_tick=100` processes ticks 90 through 100 and leaves
+`current_tick()` at 101. Therefore an action processed at tick 90 that
+schedules itself for `ctx.tick + 10` does fire at tick 100 during that run.
+If tick 100 was already completed, the driver has nothing to do. The inclusive
+rule matches the ordinary meaning of "run through tick 100" and keeps the
+action's deadline visible rather than stopping immediately before it.
+
 Same code path, different sense of time. This single split is what lets
 ten million ticks run in a unit test. Hardcoding `time.sleep` into the
 loop makes the library untestable, and that is felt immediately.
@@ -910,6 +918,64 @@ whole loop, not during it.**
   successor it queued — and the engine skips it and carries on rather than
   aborting a tick because one action has a bug.
 Every due action is asked what it wants; only then is anything written.
+
+**A skipped failure is never a silent failure.** The engine reports it through
+Python's operational logging at `ERROR` level, with the full traceback plus the
+tick, action class, `entity_id`, and permanent `seq`. It is deliberately not a
+`ctx.log(...)` story line: technical failures must not become deterministic
+game history, and the failing context is discarded. Foliot does not install or
+replace the consuming application's logging configuration, but under Python's
+default behaviour an unconfigured `ERROR` record is still written to stderr;
+an application may route it to its own console, file, or monitoring service.
+
+**A context may not both finish and reschedule its owning action.** The private
+concrete context remembers the action for which the engine created it. After
+`process()` returns and before any collected work reaches the transaction, the
+engine validates that `ctx.finish()` was not combined with
+`ctx.schedule(the_same_action, ...)`, comparing the object by identity. That
+combination says both "delete me" and "keep me" and is reported and discarded
+as a developer error. Finishing while scheduling a *different* successor is
+valid, as is rescheduling the owning action without finishing. Validation is
+after `process()` so a handler cannot bypass it by catching an exception from
+one of its own context calls; this is private engine logic and adds nothing to
+the public `TickContext` protocol.
+
+**One action object may be scheduled at most once in a tick.** Its binding has
+one permanent `seq` and one active deadline, so two schedule requests for the
+same object cannot mean two future occurrences. The engine validates all
+collected schedules by object identity before application and reports a
+duplicate as a developer error rather than silently choosing a deadline or
+creating a second queue entry. Every context that requested that duplicated
+object is discarded whole and reported, while unrelated contexts continue.
+The source actions remain pending in their original states and receive fresh
+contexts on the next tick; contexts themselves are one-attempt values and are
+never persisted or resumed. A duplicated unbound target remains unbound, and
+an already-admitted target remains unchanged. Two separately constructed
+actions remain valid even when they share a class and entity. To run one
+scheduled action at ticks 100 and 120, schedule only its next occurrence at
+100; when it processes at 100, it reschedules the same object for 120,
+preserving its `seq`.
+
+**Retry means retention, never duplication.** A handler failure does not
+enqueue anything: its collecting context is discarded before the transaction
+is drained. The one existing action remains in its one queue position, with
+the same permanent `seq`, binding, and `due_tick`, and may therefore be returned
+again by `due(...)` on the next tick. A failed recurring action likewise
+remains one member of the recurring set. No retry counter, copied action, new
+row, or second queue entry is created. This preserves pending work without
+turning repeated failures into duplicate work.
+
+**Effect failures are different and abort the tick.** A handler fails while
+describing work, before any mutation, so its context can be isolated. An
+`Effect.apply(txn.world)` failure happens after application has begun and may
+follow earlier successful effects. The engine must not catch it and continue:
+the exception escapes the tick transaction, the durable adapter rolls back the
+world, queue, journal, sequence allocator, and clock together, and the same
+unfinished tick may be retried later. The escaping exception and traceback
+make the failure visible without converting it into deterministic story text.
+`MemoryStore` rolls back only its foliot-owned state here; it cannot generically
+undo mutations an arbitrary Python world object already received (§8.5).
+
 Two consequences, and they are the reason for the whole shape:
 
 1. **Order-independence stops being a rule and becomes a property.** No
@@ -978,6 +1044,13 @@ Everything tick N did — actions marked done, new ones enqueued,
 cancellations, suspensions, effects applied, `current_tick` advanced —
 lands as one atomic write, or none of it does.
 
+Consequently, an exception from `Effect.apply(...)` is tick-fatal. Once world
+application has started, skipping one failed effect and committing the rest
+would make the tick partially applied. The exception leaves the transaction
+and forces rollback; only handler exceptions can be isolated and skipped,
+because handlers run before writes and their private contexts can be discarded
+whole (§7.4).
+
 At 1 tick/second that is 86,400 transactions a day, which is nothing for
 Postgres. Under `ManualDriver`, the in-memory store performs no I/O but its
 transaction is not a no-op: it stages foliot-owned queue changes, bindings,
@@ -1023,6 +1096,26 @@ class Txn[W](Protocol):  # the tray: writing, valid only inside a tick
     def resume(self, by: SuspensionId) -> None: ...
     def log(self, tick: Tick, line: str) -> None: ...
 ```
+
+**This is the engine's view of persistence, not a complete application
+repository API.** A concrete adapter may also expose operations for its own
+domain — initializing a model, admitting an external input, creating a market,
+loading a report, or, in the motivating game, creating a world or character.
+Those operations are deliberately absent from `Store`: another simulation may
+have none of those nouns. The core test still applies (§3): if the engine does
+not call an operation while advancing ticks, it does not belong in this
+protocol. The consuming application owns its setup and external-input
+transactions alongside its database schema and serialization.
+
+`MemoryStore` nevertheless needs a domain-neutral way to seed a new in-memory
+simulation, because there is no database setup transaction to pre-populate it.
+Its constructor therefore accepts an optional ordered `initial_actions`
+iterable of `(action, due_tick)` pairs. Construction admits each unbound action
+and assigns permanent `seq` values in iterable order without processing or
+advancing a tick. `None` creates a recurring action; a concrete initial
+deadline may equal `current_tick` so it can run on the first tick, but may not
+be in the past. This is a convenience on the concrete `MemoryStore`, not a
+method on `Store` and not a model for domain-specific production setup.
 
 `Txn.schedule(...)` accepts the mandatory game object in either binding phase.
 For `Unbound`, the store allocates the action's one permanent `seq` and calls
@@ -1778,7 +1871,7 @@ Sequenced so each milestone is independently testable.
 | M2 | **Done; Ruff and basedpyright verified.** `actions.py` — mandatory `BaseAction`, `ActionBinding`, `ActionState`, suspend/resume | M1, §6 | `Unbound | Bound` keeps admission complete; the store assigns `seq` once, and every reschedule/transition preserves it. `suspended_at`, deadline shifting, and `on_resume(paused_for)` live here so games never reimplement them. |
 | M3 | **Done; 36 tests, Ruff, and basedpyright verified.** `rng.py` — secure seed helper, counter-based streams, stable hashing | §9 | Manual unsigned 128-bit seeds; golden vectors and a real cross-`PYTHONHASHSEED` subprocess test lock replay. |
 | M4 | **Done; 50 tests, Ruff, and basedpyright verified.** `stores/memory.py` — the built-in reference/test implementation of the storage chassis | M1, M2 | `Store` / `Txn` protocols already define the chassis. M4 proves them with `due_tick` buckets, deletion, `seq` ordering, single-runner enforcement, and staged commit/rollback for foliot-owned state. |
-| M5 | `engine.py` + `ManualDriver` | M1–M4, §8 | The tick loop and the transaction boundary. |
+| M5 | **Done; 64 tests, Ruff, and basedpyright verified.** `engine.py` + `ManualDriver`; `MemoryStore(initial_actions=...)` bootstrap convenience | M1–M4, §8 | The two-phase tick loop, deterministic apply order, isolated visible handler failures, tick-fatal effect failures, context validation, and inclusive manual fast-forward. Initial in-memory actions are admitted without consuming an artificial tick; this does not widen the `Store` protocol. |
 | M6 | `RealtimeDriver` | §4.3 catch-up policy | Manual first — it is what makes M5 testable. |
 | M7 | `examples/tinyworld` | M5 | Written while the API can still change. |
 | M8 | Layer 2: `events/` — intents, grouping, resolvers | M5, §10 | Optional module. Layer 1 must work without it. |
@@ -2036,11 +2129,17 @@ useful here.
   (§5.3, §6.4).
 - Handlers tell a collecting `TickContext` and return `None`; the engine
   drains after the whole loop, and discards the context of any handler
-  that raised (§7.4).
+  that raised. Every such failure is reported through operational logging at
+  `ERROR` with its traceback and action/tick identity; it is never silently
+  swallowed or written into the deterministic story journal (§7.4).
 - `seq` is a stable identity from the store, never positional — it seeds
   the RNG and orders the journal (§9.4b).
 - `Store` reads and opens; `Txn` writes and must batch; the clock advances
   implicitly on commit (§8.5).
+- `Store` is only the narrow persistence view needed by the engine, not a full
+  application repository. Domain-specific setup and external-input operations
+  belong to each consumer's concrete adapter and never become foliot methods
+  merely because the motivating game needs them (§3, §8.5).
 - `Effect.apply(txn.world)` — game-defined and opaque to the engine; the
   world is reached through the tick transaction (§10.4).
 
@@ -2120,19 +2219,13 @@ useful here.
 
 ### Immediate next work
 
-M0 through M4 are **done**. M2 provides mandatory `BaseAction`,
+M0 through M5 are **done**. M2 provides mandatory `BaseAction`,
 `Unbound | Bound`, `Active | Suspended`, stable binding/rescheduling, and the
 pause shift with `on_resume(paused_for)` (§6.4). M3 provides explicit secure
 world-seed creation, stable per-action counter streams, unbiased bounded
 draws, and the first test tree. M4 supplies the single-runner `MemoryStore`,
 which keeps game objects directly, implements scheduled/recurring queue
-semantics, and stages all foliot-owned changes until clean commit. Ruff,
-basedpyright strict over `src/` and `tests/`, and all 50 tests pass.
-
-Next is M5, the engine loop and `ManualDriver`. The RNG-level tests already
-prove stream isolation across entity/tick/`seq` and process restarts; the full
-shuffled-action order-independence test (§14) becomes possible when M5 makes
-the loop executable.
+semantics, and stages all foliot-owned changes until clean commit.
 
 The M1 and state-shape questions are settled: handlers use
 `process(ctx) -> None`; the context collects and the engine drains after the
@@ -2162,6 +2255,22 @@ Postgres, MariaDB, MySQL, JSON, or other durable adapter. `MemoryStore` supports
 one active simulation runner, returns due snapshots in stable `seq` order, and
 rolls back its own state on exceptional exit. It exposes the supplied mutable
 world directly and does not pretend it can roll back arbitrary game mutations.
+M5 added its optional ordered `initial_actions` constructor input so an
+in-memory simulation can begin with admitted actions without a fake setup tick;
+real application initialization remains outside the narrow `Store` protocol.
+
+M5 also supplies `Simulation` and the inclusive `ManualDriver`. A tick first
+collects every due action's context, isolates and visibly reports handler or
+context failures, rejects duplicate scheduling by object identity, and only
+then applies valid contexts in permanent `seq` order inside the store's one
+transaction. Scheduled occurrences are consumed unless they reschedule;
+recurring actions remain until `finish()`. An effect failure escapes and aborts
+the tick. Ruff, basedpyright strict over `src/` and `tests/`, and all 64 tests
+pass, including reversed due-order, retry-without-duplication, and inclusive
+tick-100 boundary tests.
+
+Next is M6, `RealtimeDriver`, but its catch-up policy remains deliberately open
+and must be discussed before implementation (§4.3).
 
 ---
 

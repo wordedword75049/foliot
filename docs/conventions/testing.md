@@ -44,6 +44,40 @@ does not admit the new action to a store, so `poison.binding` remains
 `Unbound()`. A successful first `txn.schedule()` replaces it with
 `Bound(seq, Active(due_tick))` (§6.4).
 
+Engine tests for a raising handler must also capture the `foliot.engine`
+logger and prove that an `ERROR` record contains the tick, action class,
+`entity_id`, permanent `seq`, and exception traceback. Continuing the tick
+must never mean silently swallowing the developer's error, and the technical
+record must not enter the deterministic story journal.
+
+The same test must advance another tick and prove that failure retained
+exactly one pending action with the same `seq`, binding, and deadline. Retrying
+is the original queue entry becoming due again, never creation of a copied
+action or a second queue entry.
+
+Context validation tests must distinguish identity from intent: finishing and
+rescheduling the owning action is reported and discarded; finishing while
+scheduling a different successor is valid; and rescheduling the owner without
+finishing is valid. None of these checks adds a method to the public
+`TickContext` protocol.
+
+Scheduling validation must reject two requests for the same object in one
+tick, whether they came from one context or separate contexts, before applying
+any collected work. Two different action objects of the same class and entity
+remain valid. The normal scheduled chain is tested across ticks: the action
+due at 100 reschedules itself for 120 with the same permanent `seq`. For a
+cross-context duplicate, assert that every conflicting context is discarded,
+their source actions remain pending without duplication, the target remains
+unbound or unchanged, unrelated contexts still commit, and the retry uses
+fresh contexts rather than preserving decisions from the previous tick.
+
+An effect that raises is not treated like a handler that raises. Assert that
+the exception escapes `process_tick()`, the tick does not advance, and no
+foliot-owned queue, binding, sequence, or journal change commits. A durable
+adapter's own suite must additionally prove that its game-world writes roll
+back. `MemoryStore` cannot make that last assertion for an arbitrary mutable
+Python world and must not pretend otherwise (§8.5).
+
 ## Fakes, not mocks
 
 **`unittest.mock` is forbidden in this repository.** So are `pytest-mock` /
@@ -91,6 +125,19 @@ Three reasons, in ascending order of how much they would hurt here:
 time control (§4.2), and building it before `RealtimeDriver` is a decided
 build-order rule (§13). Freezing the clock globally to test a clock is
 testing the patch.
+
+`ManualDriver(until_tick=n)` includes tick `n`. Starting with tick 90 as the
+next unfinished tick and running until 100 must process ticks 90 through 100,
+including an action that rescheduled itself from 90 to 100, and leave the
+store's `current_tick()` at 101. Test this boundary explicitly; it is where an
+exclusive loop would silently skip the requested deadline.
+
+Test `MemoryStore(initial_actions=...)` as construction, not as a hidden tick:
+ordered unbound actions receive ordered permanent sequence numbers, recurring
+and scheduled queue shapes are preserved, a deadline equal to `current_tick`
+is due immediately, a past deadline is rejected, and the clock does not move.
+The convenience belongs only to the concrete in-memory implementation and must
+not appear on the `Store` protocol.
 
 ## The four architectural tests
 

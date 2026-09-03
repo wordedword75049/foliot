@@ -8,6 +8,7 @@ process; it is a reference and testing bonus, not a production database.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import TracebackType
 
@@ -78,6 +79,9 @@ class MemoryStore[W]:
     or serialization is involved. Tick transactions stage foliot-owned state
     and publish it only on a clean exit. The supplied game-owned `world` is
     exposed directly through `Txn.world` and cannot be generically rolled back.
+    Optional `initial_actions` are admitted during construction without
+    advancing the clock; this concrete bootstrap convenience is deliberately
+    absent from the engine-facing `Store` protocol.
     """
 
     __slots__ = ("_state",)
@@ -88,10 +92,34 @@ class MemoryStore[W]:
         world_seed: int,
         *,
         current_tick: Tick = 0,
+        initial_actions: Iterable[tuple[BaseAction[W], Tick | None]] = (),
     ) -> None:
         _validate_world_seed(world_seed)
         _validate_tick(current_tick, name="current_tick")
-        self._state = _MemoryState(world, world_seed, current_tick)
+        actions = tuple(initial_actions)
+        seen: set[int] = set()
+        for action, due_tick in actions:
+            action_key = id(action)
+            if action_key in seen:
+                raise ValueError("the same initial action cannot be scheduled twice")
+            seen.add(action_key)
+            match action.binding:
+                case Unbound():
+                    pass
+                case Bound():
+                    raise RuntimeError("an initial action must be unbound")
+            if due_tick is not None:
+                _validate_tick(due_tick, name="initial due_tick")
+                if due_tick < current_tick:
+                    raise ValueError("an initial due_tick cannot be before current_tick")
+
+        state = _MemoryState(world, world_seed, current_tick)
+        for seq, (action, due_tick) in enumerate(actions, start=1):
+            action.bind(seq, Active(due_tick))
+            state.actions[seq] = action
+            _add_active(state, action)
+        state.next_seq = len(actions) + 1
+        self._state = state
 
     @property
     def world_seed(self) -> int:

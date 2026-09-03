@@ -97,6 +97,53 @@ def test_memory_store_should_satisfy_store_protocol() -> None:
     accept_store(MemoryStore[World]({}, 1))
 
 
+def test_initial_actions_should_bind_in_order_without_advancing_tick() -> None:
+    recurring = ExampleAction("recurring")
+    immediate = ExampleAction("immediate")
+    store = MemoryStore[World](
+        {},
+        1,
+        current_tick=5,
+        initial_actions=((recurring, None), (immediate, 5)),
+    )
+
+    assert recurring.binding == Bound(1, Active(None))
+    assert immediate.binding == Bound(2, Active(5))
+    assert store.due(5) == (recurring, immediate)
+    assert store.current_tick() == 5
+
+
+def test_initial_actions_should_reject_past_deadlines_before_binding_anything() -> None:
+    valid = ExampleAction("valid")
+    past = ExampleAction("past")
+
+    with pytest.raises(ValueError, match="cannot be before current_tick"):
+        MemoryStore[World](
+            {},
+            1,
+            current_tick=5,
+            initial_actions=((valid, 5), (past, 4)),
+        )
+
+    assert valid.binding == Unbound()
+    assert past.binding == Unbound()
+
+
+def test_initial_actions_should_reject_duplicate_or_bound_objects() -> None:
+    duplicate = ExampleAction("duplicate")
+    with pytest.raises(ValueError, match="cannot be scheduled twice"):
+        MemoryStore[World](
+            {},
+            1,
+            initial_actions=((duplicate, None), (duplicate, 1)),
+        )
+
+    bound = ExampleAction("bound")
+    MemoryStore[World]({}, 1, initial_actions=((bound, None),))
+    with pytest.raises(RuntimeError, match="must be unbound"):
+        MemoryStore[World]({}, 1, initial_actions=((bound, None),))
+
+
 def test_new_action_should_bind_only_after_transaction_commits() -> None:
     store = MemoryStore[World]({}, 1)
     walk = ExampleAction("walk")

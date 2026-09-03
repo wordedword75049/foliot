@@ -5,14 +5,15 @@ runs at one tick per second in production and at ten million ticks per second in
 a test: only the driver differs. Hardcoding `time.sleep` into the loop makes the
 library untestable, and it is felt immediately.
 
-`ManualDriver` and `RealtimeDriver` arrive at M5 and M6.
+`ManualDriver` arrives at M5; `RealtimeDriver` follows at M6.
 """
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from foliot.ids import Tick
 
-__all__ = ["Driver"]
+__all__ = ["Driver", "ManualDriver"]
 
 
 class Driver(Protocol):
@@ -30,5 +31,26 @@ class Driver(Protocol):
         ...
 
     def should_continue(self, tick: Tick, /) -> bool:
-        """False ends the run. `ManualDriver` stops at a tick count."""
+        """Whether the next unfinished `tick` should be processed."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ManualDriver:
+    """Run immediately through an inclusive target tick."""
+
+    until_tick: Tick
+
+    def __post_init__(self) -> None:
+        if type(self.until_tick) is not int:
+            raise TypeError("until_tick must be an int, not bool")
+        if self.until_tick < 0:
+            raise ValueError("until_tick must be non-negative")
+
+    def wait_for(self, tick: Tick, /) -> None:
+        """Return immediately; manual time never sleeps."""
+        del tick
+
+    def should_continue(self, tick: Tick, /) -> bool:
+        """Include `until_tick`, then stop at the following tick."""
+        return tick <= self.until_tick
