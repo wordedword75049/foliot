@@ -30,7 +30,7 @@ from foliot.drivers import Driver
 from foliot.effects import Effect
 from foliot.ids import EntityId, SuspensionId, Tick
 from foliot.rng import Rng, counter_rng, new_world_seed
-from foliot.stores import Store, Txn
+from foliot.stores import MemoryStore, Store, Txn
 
 __all__ = [
     "ActionBinding",
@@ -41,6 +41,7 @@ __all__ = [
     "Driver",
     "Effect",
     "EntityId",
+    "MemoryStore",
     "Rng",
     "Store",
     "Suspended",

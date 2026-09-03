@@ -37,7 +37,7 @@ class TickContext[W](Protocol):
     Only once every due action has been asked does the engine drain the pile:
     schedules into the queue, effects applied, log lines written. So no action
     can observe another's changes within a tick, which is what makes a tick's
-    actions safe to process in any order, on any number of workers (§2).
+    actions safe to process in any iteration order (§2).
 
     `tick` and `rng` are read-only properties rather than plain annotations: a
     Protocol written `tick: Tick` demands something *settable*, which a real

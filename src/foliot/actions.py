@@ -191,3 +191,13 @@ class BaseAction[W](ABC):
     def process(self, ctx: TickContext[W], /) -> None:
         """Say what should happen by telling the collecting `ctx`."""
         ...
+
+
+def restore_action_binding[W](action: BaseAction[W], binding: ActionBinding, /) -> None:
+    """Restore engine-owned metadata after an in-memory commit failure.
+
+    Internal to foliot and deliberately absent from `__all__`. Consumer stores
+    use their own transaction rollback; only `MemoryStore` needs to restore a
+    Python object that was already mutated while publishing staged commands.
+    """
+    action._binding = binding  # pyright: ignore[reportPrivateUsage] -- same-module rollback

@@ -33,6 +33,12 @@ The library's value is in five guarantees, not in its object graph:
 
 Every design question ultimately reduces to whether it protects these.
 
+Exactly one active simulation runner advances a world. Many API processes and
+a standby/failover runner are fine, but simultaneous tick runners, sharding,
+worker claims, and `SKIP LOCKED` coordination are outside the supported
+architecture. Order-independence protects replay and iteration stability, not
+parallel execution.
+
 ## Scope
 
 **This repo is the library only.** It is consumed by a separate
@@ -105,8 +111,9 @@ checker you will silence.
 
 Ship `src/foliot/py.typed` or consumers get no type information at all.
 
-`dependencies` must stay empty. Postgres support goes in an extra or a
-separate distribution.
+`dependencies` must stay empty. Database adapters belong to the consuming
+game (or an independent integration package), not to foliot: the library
+supplies the `Store` / `Txn` protocols and its built-in `MemoryStore` only.
 
 ## Code conventions
 

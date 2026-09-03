@@ -7,7 +7,8 @@ because the timing is the hard part and only the engine knows it.
 Two protocols, because reading is always legal and writing is not. The only way
 to obtain a `Txn` is to be inside a tick, so there is no write method anyone
 *could* call at the wrong moment: the rule becomes unsayable rather than
-remembered.
+remembered. Even an in-memory implementation stages foliot-owned changes until
+clean exit; a context manager is a transaction boundary, not decorative syntax.
 """
 
 from collections.abc import Iterable
@@ -16,8 +17,9 @@ from typing import Protocol
 
 from foliot.actions import BaseAction
 from foliot.ids import EntityId, SuspensionId, Tick
+from foliot.stores.memory import MemoryStore
 
-__all__ = ["Store", "Txn"]
+__all__ = ["MemoryStore", "Store", "Txn"]
 
 
 class Txn[W](Protocol):
@@ -76,7 +78,8 @@ class Store[W](Protocol):
 
     The engine never calls "save". It does its work inside a boundary the store
     defines, which is why this asks for a context manager rather than a `save()`
-    method: `BEGIN`/`COMMIT` is a shape a dictionary can ignore for free.
+    method: Postgres uses `BEGIN`/`COMMIT`, while an in-memory implementation
+    stages its own queue, log, binding, and clock changes until clean exit.
 
     Two obligations that are contracts, not suggestions:
 
@@ -84,10 +87,10 @@ class Store[W](Protocol):
       that `current_tick()` then returns `n + 1`. There is deliberately no
       `advance_to`: the work and the clock are one write, so no implementation
       *can* separate them and leave the queue disagreeing with the world (§8.3).
-    - **Cancellation must reach whoever already holds an action**, not merely be
-      absent from storage. A near-horizon cache or a second worker may hold a
-      copy that a delete cannot reach, and then the wolf you cancelled still
-      bites (§5.5).
+    - **A committed deletion excludes the action from every later `due(...)`
+      snapshot.** The supported architecture has one active simulation runner
+      per world; foliot does not promise to invalidate Python references that
+      user code retained from an older snapshot (§5.5).
     """
 
     @property

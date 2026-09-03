@@ -124,14 +124,16 @@ roughly one event per minute per hero. Ten thousand characters is under
 
 What *does* matter is **per-character isolation**: character A's
 simulation must never affect character B's outcomes. That property is
-what permits out-of-order processing, retries, and sharding. Optimise for
-isolation and determinism, not raw throughput.
+what permits safe retries and makes ordinary iteration-order changes harmless.
+Optimise for isolation and determinism, not raw throughput.
 
 ### 1.6 Stack — **DECIDED**
 
 Python, PostgreSQL, and Flask-or-FastAPI (undecided and irrelevant to the
 library). The core library has **zero dependencies**. Anything
-Postgres-shaped lives in an extras group or a separate distribution.
+Postgres-, MariaDB-, MySQL-, or file-shaped belongs to the consuming game (or
+an independent integration package), not to foliot. Foliot supplies the
+storage protocols and one built-in in-memory implementation.
 
 ### 1.7 Non-technical context
 
@@ -158,8 +160,7 @@ the hard way, in production, at tick four million.
 1. **Same seed, same history.** Run N ticks twice from the same world
    seed; get byte-identical output.
 2. **Reordering the queue cannot change outcomes.** Process a tick's due
-   actions in any order, on any number of workers, and the world lands in
-   the same state.
+   actions in any iteration order and the world lands in the same state.
 3. **The clock does not drift.** Tick *n* happens at
    `start + n · duration`, not `start + n · duration + nε`.
 4. **Nothing pending is lost, and nothing is applied twice.** The tick is
@@ -438,14 +439,12 @@ does not survive §15's own conclusion: history lives in the journal, and
 the queue stays small and hot. A tombstone duplicates a journal entry
 inside the one table whose index must stay fast.
 
-**The one rule deletion imposes.** §8.5 lets a store hold a near-horizon
-cache, and §15 anticipates a second worker via `SKIP LOCKED`. An action
-already read into memory will still run after its row is deleted — the
-wolf you cancelled still bites. So **cancellation must be visible to
-whoever already holds the action**, not merely absent from the table.
-That is a conformance requirement of the `Store` protocol, owed by the
-in-memory store and the Postgres store alike, not an implementation
-detail.
+**The deletion rule under the supported single-runner model.** `due(tick)`
+returns a snapshot for the one active simulation runner. After deletion
+commits, the action must not appear in any later `due(...)` snapshot. A stale
+Python reference that user code deliberately retained is just a reference;
+the store cannot erase it and foliot never promises to. There is no cancelled
+state, claim wrapper, or `is_still_pending()` check.
 
 **Consequence:** an entity routinely has several pending actions at once —
 an arrival, a cooldown expiry, a hunger tick, a poison effect. The queue
@@ -482,7 +481,7 @@ guarantee 2 (§2) lost through a different door than §9.2's global RNG.
 
 Forbidding same-tick scheduling closes it by construction: nothing done
 during a tick is observable within that tick, so the tick's actions can
-be shuffled, sharded or retried freely.
+be shuffled or retried without changing the result.
 
 The rule costs nothing, because the game already works this way. An
 effect belongs to the interval it covers, not the instant it fires:
@@ -545,7 +544,7 @@ miniature: a wolf's damage commits at tick 5000, the process dies at
 **Cache is not checkpoint.** Memory may hold a *copy* of committed rows —
 discard it on restart, rebuild from the store, lose nothing. That is the
 near-horizon cache §8.5 already permits, and it is where the recurring
-set belongs in a Postgres store (M9). Memory must never hold state the
+set belongs in a consumer's durable store. Memory must never hold state the
 store does not have.
 
 ---
@@ -857,17 +856,18 @@ That dictionary is the whole of "the registry."
 - **In memory, no conversion happens at all.** The in-memory store holds
   the objects. No `kind`, no payload, no registry. Layer 1 never mentions
   any of it.
-- **For durability, the consumer supplies two functions**, and the
-  library states the contract without implementing it:
+- **For durability, the consumer's store owns conversion.** Two plain
+  functions are one possible shape:
 
 ```python
 def encode(action) -> tuple[str, dict]: ...  # object -> (kind, payload)
 def decode(kind, payload) -> BaseAction: ...  # (kind, payload) -> game object
 ```
 
-The Postgres store asks for that pair; the memory store does not. So
-`kind` is part of the *storage* design, appearing only when a durable
-store is plugged in — not a tax the core charges everyone.
+A consumer's Postgres, MariaDB, MySQL, or file store may use that pair; foliot
+does not require it and `MemoryStore` needs no conversion at all. So `kind` is
+part of the consumer's *storage* design, appearing only when that consumer
+chooses it — not a tax the core charges everyone.
 
 ### 7.4 The handler contract: a collecting context — **DECIDED**
 
@@ -979,8 +979,10 @@ cancellations, suspensions, effects applied, `current_tick` advanced —
 lands as one atomic write, or none of it does.
 
 At 1 tick/second that is 86,400 transactions a day, which is nothing for
-Postgres. Under `ManualDriver` with the in-memory store it costs zero,
-because the transaction is a no-op.
+Postgres. Under `ManualDriver`, the in-memory store performs no I/O but its
+transaction is not a no-op: it stages foliot-owned queue changes, bindings,
+log lines, and the clock advance, then publishes them together on a clean
+exit. An exceptional exit discards the staged work.
 
 ### 8.4 This closes the idempotency question
 
@@ -1047,11 +1049,20 @@ clean exit records tick 5 as finished and `current_tick()` then returns
 move together; making them one operation means no store *can* implement
 it otherwise.
 
-The engine never calls "save". It does its work inside a boundary the
-store defines. For the in-memory store the context manager does nothing;
-for Postgres it is `BEGIN` / `COMMIT`. That is why the interface asks for
-a context manager rather than a `save()` method: `BEGIN`/`COMMIT` is a
-shape a dictionary can ignore for free.
+The engine never calls "save". It does its work inside a boundary the store
+defines. The in-memory context manager stages changes and publishes them on
+success; Postgres uses `BEGIN` / `COMMIT`. That is why the interface asks for
+a context manager rather than a `save()` method: both implementations can
+provide the same clean-exit commit and exceptional-exit rollback shape.
+
+The in-memory transaction can make only **foliot-owned state** atomic. It
+cannot generically undo an `Effect` that has already mutated an arbitrary
+game-owned Python object supplied as `W`. M4 therefore exposes that object
+directly as `txn.world` and guarantees rollback only for its queue, action
+bindings, log, sequence allocator, and clock. This is an explicit limitation
+of the dependency-free test/quickstart store, which cannot survive a process
+exit anyway; a consumer-owned durable adapter puts its game-world writes in
+the same real transaction as its queue writes.
 
 **`Txn` must batch.** Measured against Postgres 16 with one tick per
 transaction: 10,000 actions rescheduling themselves costs **196 ms/tick
@@ -1069,7 +1080,7 @@ skips them. That is §5.1's argument, measured.)
 
 Caching is the store's business too. The near-horizon window — pull the
 next few minutes into memory rather than querying every tick — is an
-optimisation a Postgres store makes internally. The engine just asks
+optimisation a consumer's Postgres store may make internally. The engine just asks
 `due(tick)` and does not care whether that hit RAM or disk.
 
 ### 8.6 The shape, end to end
@@ -1234,8 +1245,8 @@ Two direct consequences:
 - **Crash recovery becomes lossy.** Re-running the unfinished events of a
   partially-written tick draws from a different cursor position, so the
   world after recovery is not the world that was interrupted.
-- **The queue can never be reordered.** No parallel workers, no
-  `SKIP LOCKED` with two processes, no out-of-order batches — all of them
+- **The queue can never be safely reordered.** A database returning the same
+  rows in a different order, a refactor, or a deliberately shuffled test can
   change outcomes.
 
 Note also that a global RNG silently cancels the order-independence won
@@ -1504,8 +1515,8 @@ An action is a directed edge. In library terms only the *owner* matters
 **Why this matters to the library.** If only Chars schedule their own
 next action, the queue is a forest of independent per-Char timelines that
 touch only inside Events. That is exactly the per-character isolation
-guarantee of §1.5, obtained for free — and it is what makes sharding and
-out-of-order processing valid rather than merely tempting. The core
+guarantee of §1.5, obtained for free — and it is what makes out-of-order
+iteration harmless rather than a source of invisible coupling. The core
 cannot enforce this rule, but it should be recorded as a game invariant.
 
 ### 11.3 Suspension in game terms
@@ -1607,7 +1618,7 @@ foliot/
 │       ├── engine.py           # Simulation: the tick loop
 │       ├── drivers.py          # Driver, ManualDriver, RealtimeDriver
 │       ├── stores/
-│       │   ├── __init__.py     # Store, Txn
+│       │   ├── __init__.py     # Store, Txn, MemoryStore export
 │       │   └── memory.py       # in-memory reference implementation
 │       └── events/             # LAYER 2 — optional, added after layer 1
 ├── examples/
@@ -1625,8 +1636,9 @@ foliot/
   working directory instead of the installed package — a classic source
   of "works on my machine" test results.
 - **`stores/postgres.py` deliberately absent.** It belongs in an optional
-  extra (`foliot[postgres]`) or a separate distribution, so the base
-  install stays dependency-free.
+  adapter owned by the consuming game (or an independent integration package),
+  not in foliot. The same `Store` / `Txn` protocols cover PostgreSQL, MariaDB,
+  MySQL, files, or another backend without adding dependencies to this library.
 - **`examples/tinyworld` is load-bearing, not decoration.** It is the only
   honest test of whether the public API is pleasant, and it should be
   written early enough to still change the API.
@@ -1691,8 +1703,9 @@ folder:
   consuming application configure handlers.
 - No side effects at import time.
 - No reading config files from disk. Configuration is passed in.
-- Dependencies list stays empty. Postgres support goes in an extras group
-  or a separate distribution.
+- Dependencies list stays empty. Database adapters belong to the consuming
+  game or an independent integration package; foliot ships only the protocols
+  and its dependency-free `MemoryStore`.
 - Persistence, clock driving, and randomness are all **injected
   interfaces**. The in-memory implementations that ship exist primarily
   so tests and quickstarts work without a database.
@@ -1764,12 +1777,11 @@ Sequenced so each milestone is independently testable.
 | M1 | **Done.** `ids`, `rng`, `effects`, `context`, `actions`, `drivers`, `stores` — the initial contracts, one module per concept | §3, §7 | Written fresh; the v1 draft was reference only. Its structural `Action` Protocol was useful for exposing the missing-`seq` problem, but the M2 binding decision supersedes that one contract (§7.2). |
 | M2 | **Done; Ruff and basedpyright verified.** `actions.py` — mandatory `BaseAction`, `ActionBinding`, `ActionState`, suspend/resume | M1, §6 | `Unbound | Bound` keeps admission complete; the store assigns `seq` once, and every reschedule/transition preserves it. `suspended_at`, deadline shifting, and `on_resume(paused_for)` live here so games never reimplement them. |
 | M3 | **Done; 36 tests, Ruff, and basedpyright verified.** `rng.py` — secure seed helper, counter-based streams, stable hashing | §9 | Manual unsigned 128-bit seeds; golden vectors and a real cross-`PYTHONHASHSEED` subprocess test lock replay. |
-| M4 | `stores/memory.py` — queue semantics | M1, M2 | `due_tick` buckets, deletion (with cancellation visible to already-held copies, §5.5), `seq` ordering, no-op transaction. |
+| M4 | **Done; 50 tests, Ruff, and basedpyright verified.** `stores/memory.py` — the built-in reference/test implementation of the storage chassis | M1, M2 | `Store` / `Txn` protocols already define the chassis. M4 proves them with `due_tick` buckets, deletion, `seq` ordering, single-runner enforcement, and staged commit/rollback for foliot-owned state. |
 | M5 | `engine.py` + `ManualDriver` | M1–M4, §8 | The tick loop and the transaction boundary. |
 | M6 | `RealtimeDriver` | §4.3 catch-up policy | Manual first — it is what makes M5 testable. |
 | M7 | `examples/tinyworld` | M5 | Written while the API can still change. |
 | M8 | Layer 2: `events/` — intents, grouping, resolvers | M5, §10 | Optional module. Layer 1 must work without it. |
-| M9 | Postgres store as an extra | M4, §4.4, §8 | `encode`/`decode`, `SKIP LOCKED`, `current_tick`. |
 
 **Build `ManualDriver` before `RealtimeDriver`.** The manual driver is
 not a testing afterthought; it is what lets the whole pipeline be
@@ -1785,8 +1797,9 @@ is very hard to back out of.
    the outcome.
 3. `RealtimeDriver` sustains a stable tick rate for an hour with no
    measurable drift.
-4. With the Postgres store, killing the process mid-tick and restarting
-   loses no pending events and duplicates no applied effects.
+4. `MemoryStore` publishes no foliot-owned state from a failed tick. Each
+   consumer-owned durable adapter separately proves crash recovery against
+   its chosen database or file format (§14).
 
 Items 2 and 4 are worth writing first and are the ones most likely to
 expose a design error rather than a coding error.
@@ -1817,9 +1830,12 @@ the game's own deadline through `on_resume(paused_for)`. Non-suspendable
 effects such as poison and hunger must fire throughout. This is the test
 for §6.
 
-**4. Crash recovery.** With the Postgres store, interrupt between "the
-handler ran" and "the tick committed," restart, and assert no event is
-lost and no effect is applied twice. This validates §8.
+**4. Crash recovery.** For every consumer-owned durable adapter, interrupt
+between "the handler ran" and "the tick committed," restart, and assert no
+event is lost and no effect is applied twice. This validates §8 but lives in
+the adapter's test suite, because foliot deliberately owns no database
+implementation. Within this repository, `MemoryStore` tests the corresponding
+exceptional-exit rollback for its own queue, binding, log, and clock state.
 
 Beyond those: unit-test handlers as plain functions with a fake context
 and a stub world. That is the entire point of §7.4 — if a handler cannot
@@ -1889,21 +1905,21 @@ CREATE TABLE world_state (
 );
 ```
 
-Claim pattern for the scheduled side of a worker. The recurring active set
+Due query for the single simulation runner. The recurring active set
 (`due_tick IS NULL`) is read separately or served from the store's cache, and
 `Store.due(tick)` unions the two (§5.7):
 
 ```sql
 SELECT * FROM scheduled_action
 WHERE status = 'active' AND due_tick <= $1
-ORDER BY due_tick, seq, id
-FOR UPDATE SKIP LOCKED
-LIMIT $2;
+ORDER BY due_tick, seq, id;
 ```
 
-`SKIP LOCKED` is unnecessary for a single worker but costs nothing, and
-adopting it now makes a second worker a config change rather than a
-redesign.
+The supported architecture has exactly one active simulation runner per
+world. Many API processes may serve players, and a standby runner may take
+over after failure, but two runners never execute ticks simultaneously. The
+global decision/apply barrier and single atomic tick would make concurrent
+runners a different architecture, not a configuration switch.
 
 **An `event` table is needed** — §10.2 settled that events are persisted,
 with identity and lifetime. Something must close them.
@@ -1990,6 +2006,10 @@ useful here.
 **Core shape**
 
 - foliot is defined by its five guarantees (§2), not by its object graph.
+- Exactly one active simulation runner advances a world. Many API processes
+  and standby/failover runners are compatible, but simultaneous tick runners
+  are outside the architecture; order-independence protects replay and
+  iteration stability, not parallel execution (§2, §8.3).
 - The core/game line, with the "does the engine read it?" test (§3).
   `target` is game payload, not a core field.
 - Two layers; layer 1 must be usable without layer 2 (§10.1).
@@ -2100,17 +2120,19 @@ useful here.
 
 ### Immediate next work
 
-M0 through M3 are **done**. M2 provides mandatory `BaseAction`,
+M0 through M4 are **done**. M2 provides mandatory `BaseAction`,
 `Unbound | Bound`, `Active | Suspended`, stable binding/rescheduling, and the
 pause shift with `on_resume(paused_for)` (§6.4). M3 provides explicit secure
 world-seed creation, stable per-action counter streams, unbiased bounded
-draws, and the first test tree. Ruff, basedpyright strict over `src/` and
-`tests/`, and all 36 tests pass.
+draws, and the first test tree. M4 supplies the single-runner `MemoryStore`,
+which keeps game objects directly, implements scheduled/recurring queue
+semantics, and stages all foliot-owned changes until clean commit. Ruff,
+basedpyright strict over `src/` and `tests/`, and all 50 tests pass.
 
-Next is M4, the in-memory store and its queue semantics. The RNG-level tests
-already prove stream isolation across entity/tick/`seq` and process restarts;
-the full shuffled-action order-independence test (§14) needs the engine loop
-and belongs when M5 makes that loop executable.
+Next is M5, the engine loop and `ManualDriver`. The RNG-level tests already
+prove stream isolation across entity/tick/`seq` and process restarts; the full
+shuffled-action order-independence test (§14) becomes possible when M5 makes
+the loop executable.
 
 The M1 and state-shape questions are settled: handlers use
 `process(ctx) -> None`; the context collects and the engine drains after the
@@ -2134,6 +2156,13 @@ stream, and `Rng` exposes only `random()` and `below(n)`. Manual seeds remain
 valid, `below(n)` is limited to `1 <= n <= 2**64`, and golden vectors make the
 algorithm itself a replay compatibility promise.
 
+The M4 storage division is settled too: foliot owns the `Store` / `Txn`
+protocol chassis and its dependency-free `MemoryStore`; each game owns any
+Postgres, MariaDB, MySQL, JSON, or other durable adapter. `MemoryStore` supports
+one active simulation runner, returns due snapshots in stable `seq` order, and
+rolls back its own state on exceptional exit. It exposes the supplied mutable
+world directly and does not pretend it can roll back arbitrary game mutations.
+
 ---
 
 ## 19. Superseded: what changed from v1, and why
@@ -2149,6 +2178,8 @@ Losing the reasoning is the only real cost of overwriting a document.
 | **Rendezvous (§8.1) is unresolved and blocks the registry.** | **Resolved: Option B.** Environments open events and enrol participants; `Event` is persisted. | The game's environment-as-event-spawner design answers it directly. Option A (symmetric derivation) remains available for incidental interactions. |
 | **Per-entity RNG recommended but unconfirmed**; owner preferred a global RNG. | **Decided: per-entity, counter-based.** | The Ivan/Petra example (§9.2): a global stream couples unrelated fights through a hidden cursor, breaking per-character isolation, crash recovery and any reordering. Cost objection answered by measurement (§9.3) — 1.6% of a core. |
 | **`world_seed` comes from the clock at world creation.** | **Generate one 128-bit seed from secure OS randomness and persist it for the lifetime of the one shared world.** | A clock value is guessable from the approximate creation time. That contradicts the intended unpredictability of future outcomes, especially in a permanent shared world. Deterministic replay needs a stable stored seed, not a predictable one. |
+| **The in-memory tick transaction is a no-op.** | **Stage foliot-owned queue changes, bindings, logs, and the clock; publish them only on clean exit.** | Immediate writes survive a later exception while the clock stays put, so retrying the same tick can duplicate work. A memory store cannot generically roll back arbitrary mutations inside game-owned `W`; that separate boundary remains explicit rather than being hidden by the queue fix. |
+| **Foliot will ship a Postgres adapter as an extra at M9.** | **Foliot ships only `Store` / `Txn` protocols and the built-in `MemoryStore`; each game owns its durable adapter.** | Action payloads, schemas, transactions, codecs, and database libraries are game-specific. The same protocol supports Postgres, MariaDB, MySQL, a JSON file, or something else without pulling any of them into the core. `MemoryStore` is the dependency-free reference and testing bonus, not the production recommendation. |
 | `rng = Random(hash((world_seed, entity_id, tick, seq)))` | Stable hash / integer mixing; **never `hash()` on a string.** | `hash()` is salted per process (`PYTHONHASHSEED`), so v1's snippet silently breaks replay across a restart. |
 | **Idempotency strategy is open**: idempotent handlers vs. transactional application. | **Closed.** The tick is the transaction. | With tick-atomicity there is never a half-applied tick, so idempotency is not required — except for effects that reach outside the transaction, which their authors must handle. |
 | **Action granularity is open**: is one action one narrative beat? | **Intermediate decision:** the *activity* is the narrative beat and its actions are machinery; later superseded by the no-groups decision below. | This answer produced the proposed `group_id`. §10.3 later established that a walk is one queued action, removing the machinery and the bundle together; the current answer is §6.3: the suspendable action itself is the narrative beat. |
@@ -2157,7 +2188,8 @@ Losing the reasoning is the only real cost of overwriting a document.
 | `docs/reference/protocols-draft.py` is the reference shape. | **Superseded, then deleted at M1.** | `Action` changed shape entirely (§7.1), `target` is out, and the two-layer split changed what belongs where. Keeping it cost a lint exclusion and left a wrong shape in the tree for someone to copy. Its two surviving ideas — solo-intent keys and `source_action_id` — are now in §10.5, and `git show 1d22a00:docs/reference/protocols-draft.py` has the rest. Deleting a file is not losing it; failing to extract its reasoning first would have been. |
 | **`mypy --strict`** is the type checker (§12.2). | **`basedpyright` in strict mode.** | Two behaviours mypy does not offer, both demonstrated during M0. `enableTypeIgnoreComments = false` makes `# type: ignore` stop silencing anything, so a suppression cannot be smuggled in. And `reportMatchNotExhaustive` names the unhandled member when a `match` misses a case — which is what turns adding an `ActionState` member into a compile error at every call site instead of a silent fallthrough. Corollary rule: a `case _:` branch, *even one that raises*, disables that check completely — verified, zero errors reported — so catch-alls are banned. |
 | **`requires-python = ">=3.11"`** — widest reach; PEP 695 buys foliot little because its protocols are not generic. | **`>=3.12`.** | Reversed after reading a mature in-house Python codebase whose style the owner wants to match. PEP 695 (`type Tick = int`, `class Store[A](Protocol):`) and `@typing.override` are the visible part of that style, and `override` cannot be had on 3.11 without `typing_extensions` — a dependency, which is forbidden. Cost: Debian 12's system Python (3.11) is excluded; Ubuntu 24.04 LTS (3.12) is not. The floor is enforced mechanically rather than by care — ruff infers its target from `requires-python`, so 3.13+ syntax fails to lint on a 3.14 dev machine (verified with PEP 696 defaults). |
-| **Tombstoning, not removal** — mark cancelled, skip on pop, keep the audit trail. | **Removal.** A done or cancelled action is deleted; only `active` and `suspended` exist. | The audit argument does not survive §15's own conclusion that history belongs in the journal and the queue stays small and hot — a tombstone duplicates a journal entry inside the one table whose index must stay fast. What replaces it is a conformance rule: cancellation must be visible to whoever already **holds** the action (near-horizon cache, `SKIP LOCKED` worker), since a deleted row cannot stop a copy already in RAM. |
+| **Tombstoning, not removal** — mark cancelled, skip on pop, keep the audit trail. | **Removal.** A done or cancelled action is deleted; only `active` and `suspended` exist. | The audit argument does not survive §15's conclusion that history belongs in the journal and the queue stays small and hot. Under the later single-runner decision, a committed deletion need only exclude the action from subsequent `due(...)` snapshots; foliot does not promise to invalidate arbitrary Python references retained by user code. |
+| **Design now for multiple simultaneous simulation workers** with `SKIP LOCKED`, stale-copy cancellation, and sharding. | **Exactly one active simulation runner per world.** | A tick has one global decision/apply barrier and commits atomically. Splitting it across runners requires distributed coordination and failure semantics the ZPG does not need. Many API workers and a standby runner are still fine; only one process advances ticks at a time. |
 | **`ActionState` is four statuses** — active / suspended / done / cancelled — with `remaining` alongside. | **Intermediate decision:** two states as a discriminated union, initially `Active(due_tick)` \| `Suspended(remaining, suspended_by)`; the suspended fields were later superseded by the `suspended_at` row below. | Done and cancelled are not states an action is *in*; they are it ceasing to exist. `status` is a `Literal`, so the Python value *is* the `status` column value. |
 | **`remaining` rides along while active too** — cheap, and likely to find a use. | **Intermediate decision:** keep it only while suspended; later superseded by `suspended_at`. | Three numbers — `current`, `due`, `remaining` — any two give the third. Keeping the active copy would create a second, silently divergent record of a derived value. The later recurring-action decision then made `remaining` meaningless for some suspended actions, leading to the shift rule below. |
 | **Opaque `group_id`** minted when an activity starts; suspension operates on the bundle. | **One `suspendable` bit per action**, plus `suspended_by` on the suspended state. | §6.1's motivation was that a walk is several pending actions needing one handle. §10.3 had already dissolved that — the environment's roll happens inside the walking Char's own `process()`, so a walk is *one* action and there is nothing left to bundle. Accepts the constraint that a Char has one suspendable action at a time. Waking is pushed by the event that did the suspending, never polled: ordering the queue by status to let a suspended action notice its own release would make processing order significant, which is guarantee 2 gone. |

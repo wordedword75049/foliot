@@ -112,9 +112,11 @@ shifted by the same `paused_for` (§5.3, §6.4) — while non-suspendable effect
 (poison, hunger) fired throughout (§6.2). The failure this catches is silent:
 a Char who arrives as though the fight never happened.
 
-**Crash recovery.** Postgres store only, at M9: interrupt between "the handler
-ran" and "the tick committed," restart, assert nothing is lost and nothing is
-applied twice (§8).
+**Crash recovery.** Every consumer-owned durable store tests this in its own
+adapter suite: interrupt between "the handler ran" and "the tick committed,"
+restart, assert nothing is lost and nothing is applied twice (§8). Foliot owns
+no database adapter. Its `MemoryStore` instead tests that an exceptional exit
+publishes none of its staged queue, binding, log, or clock changes.
 
 ## Conventions
 
