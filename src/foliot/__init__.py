@@ -29,7 +29,7 @@ from foliot.context import TickContext
 from foliot.drivers import Driver
 from foliot.effects import Effect
 from foliot.ids import EntityId, SuspensionId, Tick
-from foliot.rng import Rng
+from foliot.rng import Rng, counter_rng, new_world_seed
 from foliot.stores import Store, Txn
 
 __all__ = [
@@ -49,4 +49,6 @@ __all__ = [
     "TickContext",
     "Txn",
     "Unbound",
+    "counter_rng",
+    "new_world_seed",
 ]

@@ -118,9 +118,10 @@ are not re-exported; they are free to move.
 
 **No import-time side effects.** `import foliot` must not read a file, open
 a socket, call `logging.basicConfig`, or consume entropy. The sharpest case
-is §9.1: a `world_seed` drawn at import time would make replay depend on
-import order, and the bug would surface as "determinism test fails on CI
-only."
+is §9.1: generating the secure `world_seed` at import time would make world
+creation depend on import order and silently consume a new seed when no world
+is being created. Seed creation is one explicit, persisted lifecycle event,
+never an import side effect.
 
 **`logging.getLogger(__name__)`, never `basicConfig`.** Configuring handlers
 is the consuming application's decision. No `print` anywhere in `src/`.

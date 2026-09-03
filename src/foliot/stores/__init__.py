@@ -92,13 +92,12 @@ class Store[W](Protocol):
 
     @property
     def world_seed(self) -> int:
-        """Drawn from the clock once, when the world is created (§9.1).
+        """The one unsigned 128-bit seed persisted for this world (§9.1).
 
-        Persisted, and therefore read from here rather than passed in: replay
-        after a restart needs the same seed, and a seed that lives only in a
-        config file or a constructor argument is one deploy away from being
-        lost or changed. The world is born unpredictable and is reproducible
-        only in the sense that, having happened, it can be re-derived.
+        `new_world_seed()` is the secure production default, while deliberately
+        chosen values such as `1` remain valid. The store owns persistence:
+        replay after a restart needs the same value, and a seed that lives only
+        in configuration is one deploy away from being lost or changed.
         """
         ...
 

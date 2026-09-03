@@ -96,7 +96,7 @@ discuss those with the owner too. See §18 and §19.
 assuming.
 
 Python 3.12+ floor, 3.14 dev interpreter, `src/` layout, `pytest`,
-`ruff`, `basedpyright` in strict mode on `src/`. Strict typing is not
+`ruff`, `basedpyright` in strict mode on `src/` and `tests/`. Strict typing is not
 optional: the design uses structural ports plus a mandatory `BaseAction`,
 and neither contract is useful without a type checker. `# type: ignore` is
 disabled outright

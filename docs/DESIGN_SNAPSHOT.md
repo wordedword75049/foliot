@@ -1155,15 +1155,56 @@ After that they write `process()` methods and never think about saving.
 rng = counter_rng(world_seed, entity_id, tick, seq)
 ```
 
-`world_seed` is drawn from the clock **once**, when the world is created.
-So the world is born unpredictable and is only reproducible in the sense
-that, having happened, it can be re-derived.
+The public seed value is an unsigned 128-bit Python `int`:
 
-**Determinism is not predictability.** Because `tick` is part of the
-seed, walking the same forest path at tick 500 and at tick 10,000,000
-draws from completely unrelated streams. Nothing repeats and nothing is
-guessable. This was the original misunderstanding and it is worth
-restating whenever it comes up.
+```python
+0 <= world_seed < 2**128
+```
+
+Foliot provides `new_world_seed() -> int`, backed by cryptographically secure
+operating-system randomness (for example, `secrets.randbits(128)`). The game
+explicitly calls it **once** when it creates the world, persists the returned
+value permanently, and passes that value back to foliot. Seed generation is
+never an import side effect and is never inferred from the clock.
+
+The helper is the safe production default, not a mandatory source. A game may
+provide any integer in the valid range, including `0` or `1`; simple fixed
+seeds are useful for tests, examples, deliberate seeded simulations, and bug
+reproduction. Foliot validates the representation, not its entropy: non-ints,
+`bool`, negative integers, and integers at least `2**128` are rejected. It
+cannot and should not try to decide whether a valid number is "random enough."
+
+The public `Rng` contract has exactly two draws:
+
+```python
+rng.random()   # float in [0.0, 1.0)
+rng.below(n)   # uniform integer in [0, n)
+```
+
+There is no `chance(probability)` convenience method. The game owns the
+probability formula and writes `rng.random() < probability` itself; foliot
+would add vocabulary but no guarantee by wrapping that one comparison.
+
+`below(n)` accepts exactly `1 <= n <= 2**64`. Supporting larger Python
+integers would require joining multiple 64-bit draws for no realistic queue or
+game selection. Non-ints, `bool`, zero, negative values, and values greater
+than `2**64` are rejected. Every valid call consumes at least one draw,
+including `below(1)`, so the draw index continues to mean the number of public
+draw calls/attempts already made. Rejection sampling may consume additional
+draws when needed to avoid modulo bias.
+
+For ZPG, this means the one long-lived shared world: many players put
+characters into that same world and watch them live. The seed is created
+once for that world and remains fixed for its entire lifetime; it does not
+imply that the game creates a separate world per player or playthrough.
+
+**Determinism is not predictability when the seed is securely generated and
+kept private.** Because `tick` is part of the stream identity, walking the same
+forest path at tick 500 and at tick 10,000,000 draws from unrelated positions.
+A deliberately public or guessable seed such as `1` remains statistically
+useful and exactly reproducible, but a sufficiently determined player could
+calculate future results. The permanent production world's seed therefore
+stays outside player-facing state.
 
 ### 9.2 Why a global stream fails: the Ivan/Petra example
 
@@ -1212,7 +1253,7 @@ correct about the naive implementation. Measured on Python 3.11,
 | shared global `random.random()` | 0.054 µs | 18.5M |
 | new `Random(seed)` for every draw | 6.37 µs | 157k |
 | one `Random` per (entity, tick), 4 draws | 1.59 µs | 631k |
-| **counter-based (splitmix64), no state** | **0.32 µs** | **3.1M** |
+| **counter-based (splitmix64), one counter** | **0.32 µs** | **3.1M** |
 | keyed `blake2b(8)` per draw | 0.49 µs | 2.0M |
 
 The naive version is **118× slower** than the global stream, and the
@@ -1221,13 +1262,26 @@ reason is mechanical: `random.Random(seed)` builds a Mersenne Twister —
 all of it away to take one float. You pay for a 19937-bit generator to
 get 53 bits out.
 
-**The fix is to stop constructing a generator and start computing the
-answer.** A counter-based PRNG hashes
-`(world_seed, entity_id, tick, seq, draw_index)` straight into a number:
-a handful of integer multiplies and shifts, no state, no setup. This is
-the standard approach (Random123 / Philox in the numerics world) and it
-is designed for exactly this situation — enormous numbers of independent,
-addressable streams.
+**The fix is to stop constructing a large generator and start computing the
+answer.** M3 uses keyed BLAKE2b once to turn
+`(world_seed, entity_id, tick, seq)` into a stable 64-bit stream seed. The
+three identity parts are length-prefixed before hashing, so values cannot
+become ambiguous through concatenation. The world seed is encoded as exactly
+16 bytes and used as the BLAKE2b key; the digest is personalised with
+`foliot-rng-v1`.
+
+Each `Rng` then owns only a 64-bit `draw_index`. A draw adds the next counter
+step to the stream seed and applies the SplitMix64 integer mixer. `random()`
+takes the upper 53 bits and scales them into `[0.0, 1.0)`. `below(n)` uses
+rejection sampling, so the uneven remainder of the 64-bit range cannot make
+some choices microscopically more likely than others. There is no global
+cursor and no Mersenne Twister setup.
+
+This exact encoding and mixing sequence is part of the replay contract, not a
+private optimisation: changing it changes history for every existing seed.
+`tests/test_rng.py` therefore contains golden output vectors. A future
+algorithm change needs an explicit compatibility/versioning decision rather
+than a regenerated expected value.
 
 At 10,000 Chars making five draws each per tick — 50k draws/second —
 splitmix64 costs about **1.6% of one core**. Not a cost worth designing
@@ -1584,7 +1638,8 @@ foliot/
 moves fast — verify syntax against its docs rather than trusting this
 paragraph.
 
-Python 3.12+, `pytest`, `ruff`, `basedpyright` in strict mode on `src/`.
+Python 3.12+, `pytest`, `ruff`, `basedpyright` in strict mode on `src/` and
+`tests/`.
 Strict typing is not optional: the design combines structural Protocol ports
 with a mandatory stateful `BaseAction`, and neither contract protects anything
 without a type checker.
@@ -1708,7 +1763,7 @@ Sequenced so each milestone is independently testable.
 | M0 | Repo scaffold, `pyproject.toml`, lint/type/test config | — | `uv init --lib`; verify toolchain on the empty package. |
 | M1 | **Done.** `ids`, `rng`, `effects`, `context`, `actions`, `drivers`, `stores` — the initial contracts, one module per concept | §3, §7 | Written fresh; the v1 draft was reference only. Its structural `Action` Protocol was useful for exposing the missing-`seq` problem, but the M2 binding decision supersedes that one contract (§7.2). |
 | M2 | **Done; Ruff and basedpyright verified.** `actions.py` — mandatory `BaseAction`, `ActionBinding`, `ActionState`, suspend/resume | M1, §6 | `Unbound | Bound` keeps admission complete; the store assigns `seq` once, and every reschedule/transition preserves it. `suspended_at`, deadline shifting, and `on_resume(paused_for)` live here so games never reimplement them. |
-| M3 | `rng.py` — counter-based streams, stable hashing | §9 | Watch `PYTHONHASHSEED` (§9.4). |
+| M3 | **Done; 36 tests, Ruff, and basedpyright verified.** `rng.py` — secure seed helper, counter-based streams, stable hashing | §9 | Manual unsigned 128-bit seeds; golden vectors and a real cross-`PYTHONHASHSEED` subprocess test lock replay. |
 | M4 | `stores/memory.py` — queue semantics | M1, M2 | `due_tick` buckets, deletion (with cancellation visible to already-held copies, §5.5), `seq` ordering, no-op transaction. |
 | M5 | `engine.py` + `ManualDriver` | M1–M4, §8 | The tick loop and the transaction boundary. |
 | M6 | `RealtimeDriver` | §4.3 catch-up policy | Manual first — it is what makes M5 testable. |
@@ -1828,7 +1883,8 @@ CREATE INDEX scheduled_action_suspended_by
 CREATE TABLE world_state (
     id           SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     current_tick BIGINT      NOT NULL,
-    world_seed   BIGINT      NOT NULL,
+    world_seed   NUMERIC(39) NOT NULL
+        CHECK (world_seed >= 0 AND world_seed < 340282366920938463463374607431768211456),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -2003,8 +2059,19 @@ useful here.
 **Randomness**
 
 - Per-entity, counter-based streams seeded on
-  `(world_seed, entity_id, tick, seq)`; `world_seed` from the clock at
-  world creation (§9.1).
+  `(world_seed, entity_id, tick, seq)`; the one shared world's 128-bit
+  `world_seed` is generated once from secure OS randomness and persisted
+  permanently (§9.1).
+- Foliot provides the explicit `new_world_seed()` safe default, while the game
+  owns when to create the world and how to persist its seed. Manually supplied
+  unsigned 128-bit integers, including `0` and `1`, remain valid; foliot
+  validates range and type but never judges entropy (§9.1).
+- `Rng` exposes only `random()` and `below(n)`. Probability formulas and the
+  comparison for whether an event happens remain game logic; there is no
+  `chance()` convenience method (§9.1).
+- `below(n)` accepts `1 <= n <= 2**64`, rejects `bool`, and uses rejection
+  sampling rather than biased modulo reduction. Even `below(1)` consumes a
+  draw (§9.1).
 - Stable hashing, never `hash()` on strings (§9.4).
 - Deterministic ids for ephemeral entities (§9.5).
 
@@ -2018,7 +2085,7 @@ useful here.
 **Project**
 
 - Library named `foliot`; `uv` for everything; Python 3.12+ floor with a
-  3.14 dev interpreter (§12.4); `basedpyright` strict on `src/`.
+  3.14 dev interpreter (§12.4); `basedpyright` strict on `src/` and `tests/`.
 
 ### Open, needs deciding
 
@@ -2033,11 +2100,17 @@ useful here.
 
 ### Immediate next work
 
-M0, M1, and M2 are **done**. M2 provides mandatory `BaseAction`,
+M0 through M3 are **done**. M2 provides mandatory `BaseAction`,
 `Unbound | Bound`, `Active | Suspended`, stable binding/rescheduling, and the
-pause shift with `on_resume(paused_for)` (§6.4), verified by Ruff and
-basedpyright strict. Next create `tests/` and add `"tests"` to
-`basedpyright.include`; write the order-independence test first (§14).
+pause shift with `on_resume(paused_for)` (§6.4). M3 provides explicit secure
+world-seed creation, stable per-action counter streams, unbiased bounded
+draws, and the first test tree. Ruff, basedpyright strict over `src/` and
+`tests/`, and all 36 tests pass.
+
+Next is M4, the in-memory store and its queue semantics. The RNG-level tests
+already prove stream isolation across entity/tick/`seq` and process restarts;
+the full shuffled-action order-independence test (§14) needs the engine loop
+and belongs when M5 makes that loop executable.
 
 The M1 and state-shape questions are settled: handlers use
 `process(ctx) -> None`; the context collects and the engine drains after the
@@ -2055,6 +2128,12 @@ action's `seq` afterwards. No wrapper or second action class is involved. M2
 exposes `bind(seq, state)` for first admission or hydration and
 `reschedule(due_tick)` for later scheduling of the same active object.
 
+The M3 public surface is settled: `new_world_seed()` produces the secure
+128-bit default, `counter_rng(world_seed, entity_id, tick, seq)` binds a
+stream, and `Rng` exposes only `random()` and `below(n)`. Manual seeds remain
+valid, `below(n)` is limited to `1 <= n <= 2**64`, and golden vectors make the
+algorithm itself a replay compatibility promise.
+
 ---
 
 ## 19. Superseded: what changed from v1, and why
@@ -2069,6 +2148,7 @@ Losing the reasoning is the only real cost of overwriting a document.
 | **`target` should be a first-class core field** (argued mid-session), driving event-key derivation and cascade cancels. | **`target` is game payload.** | The engine never reads it. Environments open events explicitly, so no key derivation is needed. Fails the "does the engine read it?" test. |
 | **Rendezvous (§8.1) is unresolved and blocks the registry.** | **Resolved: Option B.** Environments open events and enrol participants; `Event` is persisted. | The game's environment-as-event-spawner design answers it directly. Option A (symmetric derivation) remains available for incidental interactions. |
 | **Per-entity RNG recommended but unconfirmed**; owner preferred a global RNG. | **Decided: per-entity, counter-based.** | The Ivan/Petra example (§9.2): a global stream couples unrelated fights through a hidden cursor, breaking per-character isolation, crash recovery and any reordering. Cost objection answered by measurement (§9.3) — 1.6% of a core. |
+| **`world_seed` comes from the clock at world creation.** | **Generate one 128-bit seed from secure OS randomness and persist it for the lifetime of the one shared world.** | A clock value is guessable from the approximate creation time. That contradicts the intended unpredictability of future outcomes, especially in a permanent shared world. Deterministic replay needs a stable stored seed, not a predictable one. |
 | `rng = Random(hash((world_seed, entity_id, tick, seq)))` | Stable hash / integer mixing; **never `hash()` on a string.** | `hash()` is salted per process (`PYTHONHASHSEED`), so v1's snippet silently breaks replay across a restart. |
 | **Idempotency strategy is open**: idempotent handlers vs. transactional application. | **Closed.** The tick is the transaction. | With tick-atomicity there is never a half-applied tick, so idempotency is not required — except for effects that reach outside the transaction, which their authors must handle. |
 | **Action granularity is open**: is one action one narrative beat? | **Intermediate decision:** the *activity* is the narrative beat and its actions are machinery; later superseded by the no-groups decision below. | This answer produced the proposed `group_id`. §10.3 later established that a walk is one queued action, removing the machinery and the bundle together; the current answer is §6.3: the suspendable action itself is the narrative beat. |

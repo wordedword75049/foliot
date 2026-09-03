@@ -126,6 +126,10 @@ applied twice (§8).
 - Shared fixtures in `conftest.py`; construction helpers in `tests/factories.py`.
 - Cover negative paths. An action that is cancelled, suspended twice, or
   resumed after its deadline passed is where the bookkeeping breaks.
+- Lock deterministic RNG output with golden vectors. Updating those expected
+  values is a replay-format change, never routine test maintenance (§9.3).
+- Run RNG stability in real subprocesses with different `PYTHONHASHSEED`
+  values; two instances inside one interpreter cannot expose salted hashing.
 - `examples/tinyworld` is a test in disguise (§12.1): it is the only honest
   check that the public API is pleasant, and it must be written while the API
   can still change.

@@ -51,10 +51,8 @@ ban-relative-imports = "all"
 typeCheckingMode = "strict"
 # The FLOOR, not the dev interpreter: 3.14 must not smuggle in 3.13+ syntax.
 pythonVersion = "3.12"
-# Add "tests" as soon as the test tree is created after M2, and "examples"
-# at M7: a fake that drifts from its Protocol is exactly what strict checking
-# should catch.
-include = ["src"]
+# Test fakes are part of the checked contract. Add "examples" at M7.
+include = ["src", "tests"]
 venvPath = "."
 venv = ".venv"
 # A checker you can silence is a checker you will silence.
