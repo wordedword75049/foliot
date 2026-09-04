@@ -321,6 +321,7 @@ def test_failed_reschedule_commit_should_restore_store_owned_state() -> None:
 
     with store.tick_transaction(0) as txn:
         txn.schedule(walk, 10)
+        txn.log(0, "committed before later failure")
     with store.tick_transaction(1) as txn:
         txn.suspend(EntityId("ivan"), fight)
 
@@ -328,6 +329,6 @@ def test_failed_reschedule_commit_should_restore_store_owned_state() -> None:
         fail_suspended_reschedule(store, walk, tick=2)
 
     assert walk.binding == Bound(1, Suspended(1, fight, 10))
-    assert store.logs == ()
+    assert store.logs == ((0, "committed before later failure"),)
     assert store.current_tick() == 2
     assert store.due(100) == ()

@@ -227,7 +227,10 @@ def test_manual_driver_should_include_target_tick_and_fire_its_deadline() -> Non
 
 
 def test_recurring_action_should_run_each_tick_without_rescheduling() -> None:
-    action = RecurringAction(EntityId("recurring"), suspendable=False)
+    action = RecurringAction(
+        EntityId("recurring"),
+        suspendable=False,
+    )
     world: World = {}
     store = MemoryStore(world, 1, initial_actions=((action, None),))
 
@@ -265,9 +268,15 @@ def test_processing_order_should_not_change_world_rng_or_story_order() -> None:
 def test_handler_failure_should_be_visible_retry_without_duplication_and_continue(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    successor = CompleteAction(EntityId("successor"), suspendable=False)
+    successor = CompleteAction(
+        EntityId("successor"),
+        suspendable=False,
+    )
     failing = FailingHandler(successor)
-    successful = CompleteAction(EntityId("working"), suspendable=False)
+    successful = CompleteAction(
+        EntityId("working"),
+        suspendable=False,
+    )
     world: World = {}
     store = MemoryStore(
         world,
@@ -306,7 +315,10 @@ def test_handler_failure_should_be_visible_retry_without_duplication_and_continu
 
 
 def test_finish_should_allow_a_different_successor() -> None:
-    successor = CompleteAction(EntityId("successor"), suspendable=False)
+    successor = CompleteAction(
+        EntityId("successor"),
+        suspendable=False,
+    )
     source = FinishWithSuccessor(successor)
     store = MemoryStore[World]({}, 1, initial_actions=((source, None),))
 
@@ -319,7 +331,10 @@ def test_finish_should_allow_a_different_successor() -> None:
 def test_finish_and_self_reschedule_should_discard_context(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    action = FinishAndReschedule(EntityId("contradiction"), suspendable=False)
+    action = FinishAndReschedule(
+        EntityId("contradiction"),
+        suspendable=False,
+    )
     store = MemoryStore[World]({}, 1, initial_actions=((action, None),))
     caplog.set_level(logging.ERROR, logger="foliot.engine")
 
@@ -333,7 +348,10 @@ def test_finish_and_self_reschedule_should_discard_context(
 def test_duplicate_schedule_in_one_context_should_discard_it(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    target = CompleteAction(EntityId("target"), suspendable=False)
+    target = CompleteAction(
+        EntityId("target"),
+        suspendable=False,
+    )
     source = ScheduleTarget("source", target, twice=True)
     store = MemoryStore[World]({}, 1, initial_actions=((source, None),))
     caplog.set_level(logging.ERROR, logger="foliot.engine")
@@ -349,10 +367,16 @@ def test_duplicate_schedule_in_one_context_should_discard_it(
 def test_duplicate_schedule_across_contexts_should_discard_both_and_continue(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    target = CompleteAction(EntityId("target"), suspendable=False)
+    target = CompleteAction(
+        EntityId("target"),
+        suspendable=False,
+    )
     first = ScheduleTarget("first", target)
     second = ScheduleTarget("second", target)
-    unrelated = CompleteAction(EntityId("unrelated"), suspendable=False)
+    unrelated = CompleteAction(
+        EntityId("unrelated"),
+        suspendable=False,
+    )
     world: World = {}
     store = MemoryStore(
         world,
@@ -371,7 +395,10 @@ def test_duplicate_schedule_across_contexts_should_discard_both_and_continue(
 
 
 def test_effect_failure_should_escape_and_roll_back_foliot_state() -> None:
-    successor = CompleteAction(EntityId("successor"), suspendable=False)
+    successor = CompleteAction(
+        EntityId("successor"),
+        suspendable=False,
+    )
     source = EffectFailure(successor)
     store = MemoryStore[World]({}, 1, initial_actions=((source, None),))
     simulation = Simulation(store)

@@ -74,9 +74,9 @@ type ActionBinding = Unbound | Bound
 class BaseAction[W](ABC):
     """Mandatory blueprint for every game action entering foliot's queue.
 
-    The base owns only fields the engine reads. Subclasses keep all game-owned
-    payload -- poison damage, tick interval, arrival deadline, and so on -- on
-    the same object and implement `process()`.
+    The base owns only the lifecycle fields foliot needs. Subclasses keep all
+    game-owned payload -- target, poison damage, tick interval, arrival
+    deadline, and so on -- on the same object and implement `process()`.
     """
 
     __slots__ = ("_binding", "_entity_id", "_suspendable")
@@ -88,6 +88,7 @@ class BaseAction[W](ABC):
 
     @property
     def entity_id(self) -> EntityId:
+        """The entity that owns this queued action."""
         return self._entity_id
 
     @property

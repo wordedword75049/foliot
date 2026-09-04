@@ -179,9 +179,9 @@ is foliot's reason to exist.
 **The inclusion test.** For any candidate feature, ask: *does it add a
 guarantee the consumer cannot easily provide themselves?* If yes, it may
 belong in the library. If it is merely vocabulary or convenience, it
-belongs in the game. This test decided §10 (intents/events are in,
-because they add simultaneity) and §3 (targets are out, because the
-engine never reads them).
+belongs in the game. This test decided §10 (intents/events are in because they
+add simultaneity) and §3 (`target_id` belongs in a game's action base because
+the Layer 1 engine neither reads nor enforces it).
 
 **Small surface, strong promises.** That is a library. Large surface,
 vague promises, is a framework nobody can test.
@@ -192,11 +192,14 @@ vague promises, is a framework nobody can test.
 
 **foliot is: a clock, a queue of scheduled things, a way to look up what
 to run, and a source of addressable randomness.** It knows about ticks,
-due times, statuses, ordering, and seeds. It has never heard of a target,
-a location, an environment, an activity, or combat.
+due times, statuses, ordering, seeds, and an action's owning `entity_id`. It has
+never heard of a target, location, environment, activity, or combat rule.
 
-**The membership test for a field:** *does the engine read it?* If the
-engine never reads it, it goes in the game's payload, not in a core type.
+**The membership test for a field:** *does the engine read or enforce it?* If
+not, it goes in the game's payload. A game that treats every action as directed
+can enforce that once in `GameAction(BaseAction)`; every game action still
+inherits foliot's mandatory lifecycle class without imposing the target model
+on unrelated simulations.
 
 | Core (`foliot`) | Game |
 |---|---|
@@ -206,18 +209,19 @@ engine never reads it, it goes in the game's payload, not in a core type.
 | `ActionState`: active or suspended; scheduled actions preserve a `due_tick`, recurring actions have none | encounter rolls, and what `p` depends on |
 | `suspendable` — one bit: does this action stop when its owner is interrupted | which actions are suspendable, and what interrupts them |
 | Mandatory `BaseAction` + engine-owned binding bookkeeping | HP, mana, `entity_state`, damage |
-| Counter-based RNG on `(world_seed, entity_id, tick, seq)` | targets — who an action is aimed at |
+| Counter-based RNG on `(world_seed, entity_id, tick, seq)` | `GameAction.target_id`, target lookup, and what acting against a target means |
 | `Store` protocol + in-memory implementation | narrative log text |
 | The tick-transaction boundary | the `encode`/`decode` pair, and the database |
 | Layer 2 (optional): intents, event grouping, resolvers | what a resolver decides |
 
-**Notable exclusion — `target`.** An earlier position in this session
-argued for `target` as a first-class core field, on the grounds that it
-would drive event-key derivation and cascading cancellation. **Reversed.**
-The engine never needs to read it: in this design the environment opens
-events explicitly (§10.2), so no key derivation is required, and
-cancellation is something the game requests. `entity_id` (the owner)
-stays in core, because the queue indexes on it and the RNG seeds on it.
+**Notable exclusion — `target_id`; directed game actions remain easy.** The
+game's ontology says every action is directed, but that is not true of every
+simulation. Making the core field nullable would pay the schema and API cost
+without guaranteeing direction; making it mandatory would force targetless or
+multi-target simulations to invent values. Tinyworld instead defines a
+non-null `GameAction.target_id` once. `BaseAction.entity_id` remains the queue
+owner, suspension key, and RNG identity; it is not necessarily the narrative
+actor or source.
 
 ---
 
@@ -867,11 +871,31 @@ class Poison(BaseAction[World]):
         ...
 ```
 
-`BaseAction` owns `entity_id`, `suspendable`, the `Unbound | Bound` binding,
-stable `seq`, and all suspension bookkeeping. The subclass owns its behaviour
-and every game-specific field. Binding replaces only the library-owned binding
-value, never the subclass object, so `damage`, `tick_interval`, `arrives_at`,
-and `process()` survive admission and every later transition unchanged.
+`BaseAction` owns `entity_id` (the queue owner), `suspendable`, the
+`Unbound | Bound` binding, stable `seq`, and all suspension bookkeeping. The
+subclass owns its behaviour and every game-specific field. Binding replaces
+only the library-owned binding value, never the subclass object, so `damage`,
+`tick_interval`, `arrives_at`, and `process()` survive admission and every
+later transition unchanged.
+
+A directed game should express that rule once, without making every simulation
+use it:
+
+```python
+class GameAction(BaseAction[World]):
+    def __init__(self, entity_id, target_id, *, suspendable):
+        super().__init__(entity_id, suspendable=suspendable)
+        self.target_id = target_id
+
+class Walk(GameAction):
+    ...
+```
+
+Every `Walk`, `Rest`, and `Poison` still inherits foliot's mandatory
+`BaseAction`, while the game also guarantees its own non-null `target_id`.
+`BaseAction.entity_id` means queue owner, not necessarily narrative actor or
+cause. For example, an ongoing poison condition can be owned by and target
+Lira while carrying the forest as a separate game-owned `source_id`.
 
 This is intentionally different from the other foliot boundaries. `Store`,
 `Driver`, `Rng`, `Effect`, and `TickContext` remain structural Protocols because
@@ -883,8 +907,9 @@ identity and suspension correctness.
 The M1 `Action` Protocol is therefore superseded at M2. Queue-facing
 signatures use `BaseAction[W]`, and a store must never return an action whose
 binding is `Unbound`. The name remains useful as the ordinary concept — “an
-action” — but there is no second `Action(BaseAction)` object and no conversion
-that could discard subclass fields (§6.4).
+action” — but foliot has no second lifecycle wrapper and performs no conversion
+that could discard subclass fields (§6.4). A game's `GameAction(BaseAction)` is
+ordinary inheritance on the same object, not the rejected wrapper design.
 
 ### 7.3 Serialisation belongs to the store — **DECIDED**
 
@@ -1654,8 +1679,10 @@ what it is done against.
 - walking in the forest — `walk(Char, Forest)`
 - being poisoned while walking — `damage_effect(Forest, Char)`
 
-An action is a directed edge. In library terms only the *owner* matters
-(§3); the target is game payload.
+An action is a directed edge in this game. The game-owned
+`GameAction(BaseAction)` therefore stores a non-null `target_id`; resolving the
+target and deciding what acting against it means remain game responsibilities
+(§3, §7.2).
 
 ### 11.2 The entity ontology
 
@@ -1747,6 +1774,38 @@ queued actions?"* — is a question it asks **its own store
 implementation**, not something the `Store` protocol must require of
 everyone. The shipped in-memory store may offer it as a convenience for
 `examples/` and tests; the protocol stays at three methods (§8.5).
+
+### 11.8 M7 Tinyworld — **DECIDED**
+
+The bundled example stays under `examples/tinyworld/`, outside
+`src/foliot/`; the real game will be a separate project. Tinyworld is a
+load-bearing public-API test, not the start of that game.
+
+Lira repeatedly crosses a haunted forest between the forest-edge clearing and
+a moonlit clearing. Both clearings and the forest are game-owned entities.
+Tinyworld defines `GameAction(BaseAction)` with a mandatory non-null
+`target_id`, then derives all of its actions from that game-owned class.
+`Walk.target_id` is the forest it acts against; its separate `destination_id`
+is where arrival will place Lira. The forest derives poison probability from
+its hauntedness and Lira's perception using only the action's `ctx.rng`. A
+poison encounter schedules `Poison`, which is owned by and acts against Lira,
+emits damage, and reschedules the same object at its interval until it expires.
+
+On arrival, `Walk` resolves its destination, schedules a one-shot `Rest`
+targeting that clearing, and finishes. It does not decide what happens in the
+clearing or carry the return route. `Rest` owns clearing behaviour: it decides
+whether a moonlit-clearing visit with below-half HP calls for potion healing,
+asks Tinyworld's game-specific `Pathing` service for the nearest POI and which
+environment connects the two places, and schedules
+`Walk(target_id=forest_id, destination_id=other_clearing_id)`. A real game would
+replace the mock nearest-POI mapping with geography and may let intended
+destinations, goals, or quests select the POI before asking pathing for a route.
+Clearing entities themselves contain no navigation policy. `TickContext`
+remains narrow, and world changes still happen only through staged effects.
+
+The example uses `MemoryStore`, a fixed manual seed, and `ManualDriver` for one
+million ticks. It prints a compact summary rather than the whole journal, and
+repeated runs must produce the same final state and journal digest.
 
 ---
 
@@ -1905,9 +1964,9 @@ Three things were verified by running them, not by reading docs:
    `ActionState` member a compile error at every call site instead of a
    silent fallthrough at tick four million.
 
-`basedpyright.include` is `["src"]` today; `tests` joins it as soon as the
-test tree is created after M2, and `examples` at M7. A fake that drifts from
-its Protocol is exactly what strict checking should catch
+`basedpyright.include` is `["src", "tests", "examples"]`. Test fakes and the
+bundled example are consumers of the public contracts, so drift from a
+Protocol is exactly what strict checking should catch
 (`docs/conventions/testing.md`).
 
 Metadata fixed at M0, all of it library-specific and all of it shipped to
@@ -1934,12 +1993,12 @@ Sequenced so each milestone is independently testable.
 |---|---|---|---|
 | M0 | Repo scaffold, `pyproject.toml`, lint/type/test config | — | `uv init --lib`; verify toolchain on the empty package. |
 | M1 | **Done.** `ids`, `rng`, `effects`, `context`, `actions`, `drivers`, `stores` — the initial contracts, one module per concept | §3, §7 | Written fresh; the v1 draft was reference only. Its structural `Action` Protocol was useful for exposing the missing-`seq` problem, but the M2 binding decision supersedes that one contract (§7.2). |
-| M2 | **Done; Ruff and basedpyright verified.** `actions.py` — mandatory `BaseAction`, `ActionBinding`, `ActionState`, suspend/resume | M1, §6 | `Unbound | Bound` keeps admission complete; the store assigns `seq` once, and every reschedule/transition preserves it. `suspended_at`, deadline shifting, and `on_resume(paused_for)` live here so games never reimplement them. |
+| M2 | **Done; Ruff and basedpyright verified.** `actions.py` — mandatory `BaseAction`, `ActionBinding`, `ActionState`, suspend/resume | M1, §6 | Every action supplies its opaque owner `entity_id`; directed games add `target_id` in their own action base. `Unbound | Bound` keeps admission complete; the store assigns `seq` once, and every reschedule/transition preserves it. `suspended_at`, deadline shifting, and `on_resume(paused_for)` live here so games never reimplement them. |
 | M3 | **Done; 36 tests, Ruff, and basedpyright verified.** `rng.py` — secure seed helper, counter-based streams, stable hashing | §9 | Manual unsigned 128-bit seeds; golden vectors and a real cross-`PYTHONHASHSEED` subprocess test lock replay. |
 | M4 | **Done; 50 tests, Ruff, and basedpyright verified.** `stores/memory.py` — the built-in reference/test implementation of the storage chassis | M1, M2 | `Store` / `Txn` protocols already define the chassis. M4 proves them with `due_tick` buckets, deletion, `seq` ordering, single-runner enforcement, and staged commit/rollback for foliot-owned state. |
 | M5 | **Done; 64 tests, Ruff, and basedpyright verified.** `engine.py` + `ManualDriver`; `MemoryStore(initial_actions=...)` bootstrap convenience | M1–M4, §8 | The two-phase tick loop, deterministic apply order, isolated visible handler failures, tick-fatal effect failures, context validation, and inclusive manual fast-forward. Initial in-memory actions are admitted without consuming an artificial tick; this does not widen the `Store` protocol. |
 | M6 | **Done; 86 tests, Ruff, and basedpyright verified.** `RealtimeDriver` | §§4.1, 4.3, 4.4 | Its only public input is positive finite whole or fractional `tick_seconds`; clock/sleep seams stay private. The first tick runs immediately on a fresh cadence. Missed wall-clock slots are skipped; logical ticks are not. Each overrunning tick emits one operational `WARNING`; foliot does not persist or aggregate timing measurements. Downtime pauses simulation time. The driver runs until external interruption and owns no stop mechanism. |
-| M7 | `examples/tinyworld` | M5 | Written while the API can still change. |
+| M7 | **Done; 88 tests, Ruff, and basedpyright verified.** `examples/tinyworld` | M5 | Lira's fixed-seed world exercises recurring walks, scheduled interval poison, staged damage/healing, and arrival-selected successor actions through public Layer 1 only. Two independent one-million-tick runs produced the same world and journal SHA-256. |
 | M8 | Layer 2: `events/` — intents, grouping, resolvers | M5, §10 | Optional module. Layer 1 must work without it. |
 
 **Build `ManualDriver` before `RealtimeDriver`.** The manual driver is
@@ -2101,7 +2160,7 @@ history in the journal, keep the queue small and hot.
 | Term | Meaning here |
 |---|---|
 | **Tick** | One discrete step of world time. ~1 real second, configurable. Monotonic integer. |
-| **Action** | A game object inheriting `BaseAction`, owned by one entity and carrying `process()`. It starts `Unbound` and becomes `Bound(seq, state)` on first queue admission. |
+| **Action** | A game object inheriting `BaseAction`, owned by one entity and carrying `process()`. It starts `Unbound` and becomes `Bound(seq, state)` on first queue admission. A directed game may add mandatory `target_id` in its own `GameAction` base. |
 | **`due_tick`** | The absolute tick at which an action becomes due. The queue's primitive. |
 | **`suspended_at`** | The tick a pause began. Resume shifts every deadline — the core's and the game's — forward by `now - suspended_at`. |
 | **Recurring** | An action that runs every tick and carries no `due_tick`, because for it the next due tick is always `now + 1`. |
@@ -2169,8 +2228,9 @@ useful here.
   and standby/failover runners are compatible, but simultaneous tick runners
   are outside the architecture; order-independence protects replay and
   iteration stability, not parallel execution (§2, §8.3).
-- The core/game line, with the "does the engine read it?" test (§3).
-  `target` is game payload, not a core field.
+- The core/game line, tested by "does the engine read or enforce it?" (§3).
+  `target_id` belongs in the game's mandatory `GameAction(BaseAction)`, not in
+  foliot or as a nullable compromise.
 - Two layers; layer 1 must be usable without layer 2 (§10.1).
 - Absolute-deadline clock (§4.1); pluggable drivers (§4.2).
 
@@ -2221,7 +2281,9 @@ useful here.
   admission, then `Bound(seq, state)`. It prevents half-bound objects without
   adding a third `ActionState` (§6.4).
 - `BaseAction` is mandatory for every game action entering the queue. It owns
-  binding and both transitions so games never reimplement them (§7.2).
+  `entity_id`, binding, and both transitions so games never reimplement them;
+  a directed game layers its mandatory `target_id` on a game-owned base
+  (§7.2).
 - First successful `txn.schedule()` assigns `seq` once. Rescheduling,
   suspension, and resumption preserve it on the same game object, including
   all subclass-defined payload fields (§6.4, §9.4b).
@@ -2270,7 +2332,8 @@ useful here.
 **Project**
 
 - Library named `foliot`; `uv` for everything; Python 3.12+ floor with a
-  3.14 dev interpreter (§12.4); `basedpyright` strict on `src/` and `tests/`.
+  3.14 dev interpreter (§12.4); `basedpyright` strict on `src/`, `tests/`, and
+  `examples/`.
 
 ### Open, needs deciding
 
@@ -2281,13 +2344,14 @@ useful here.
 
 ### Immediate next work
 
-M0 through M6 are **done**. M2 provides mandatory `BaseAction`,
-`Unbound | Bound`, `Active | Suspended`, stable binding/rescheduling, and the
-pause shift with `on_resume(paused_for)` (§6.4). M3 provides explicit secure
-world-seed creation, stable per-action counter streams, unbiased bounded
-draws, and the first test tree. M4 supplies the single-runner `MemoryStore`,
-which keeps game objects directly, implements scheduled/recurring queue
-semantics, and stages all foliot-owned changes until clean commit.
+M0 through M7 are **done**. M2 provides mandatory `BaseAction`, including its
+opaque owner `entity_id`, `Unbound | Bound`,
+`Active | Suspended`, stable binding/rescheduling, and the pause shift with
+`on_resume(paused_for)` (§6.4). M3 provides explicit secure world-seed creation,
+stable per-action counter streams, unbiased bounded draws, and the first test
+tree. M4 supplies the single-runner `MemoryStore`, which keeps game objects
+directly, implements scheduled/recurring queue semantics, and stages all
+foliot-owned changes until clean commit.
 
 The M1 and state-shape questions are settled: handlers use
 `process(ctx) -> None`; the context collects and the engine drains after the
@@ -2298,8 +2362,10 @@ classes, active and suspended; new actions carry `Unbound()` until a successful
 `txn.schedule()` replaces it with `Bound(seq, Active(due_tick))`; and the
 convention documents exist.
 
-The M2 admission boundary is also settled: `BaseAction` is mandatory and
-always carries `Unbound | Bound`. The store replaces `Unbound()` with
+The M2 admission boundary is also settled: `BaseAction` is mandatory, requires
+opaque owner `entity_id`, and always carries `Unbound | Bound`. A directed game
+adds non-null `target_id` once in its own `GameAction(BaseAction)`. The store
+replaces `Unbound()` with
 `Bound(seq, Active(due_tick))` on first admission and never changes that
 action's `seq` afterwards. No wrapper or second action class is involved. M2
 exposes `bind(seq, state)` for first admission or hydration and
@@ -2320,6 +2386,10 @@ world directly and does not pretend it can roll back arbitrary game mutations.
 M5 added its optional ordered `initial_actions` constructor input so an
 in-memory simulation can begin with admitted actions without a fake setup tick;
 real application initialization remains outside the narrow `Store` protocol.
+M7 exposed and removed one quadratic implementation cost: journal rollback now
+remembers the old list length and truncates new entries on failure instead of
+copying the entire accumulated history before every tick. The transaction
+guarantee is unchanged.
 
 M5 also supplies `Simulation` and the inclusive `ManualDriver`. A tick first
 collects every due action's context, isolates and visibly reports handler or
@@ -2339,8 +2409,21 @@ count. Timing measurements never enter `Store`; downtime pauses simulation
 time; the driver owns no stop mechanism; and clock/sleep seams remain private.
 The fake-time suite verifies a full simulated hour without real sleeping.
 
-Next is M7, `examples/tinyworld`, written while the complete Layer 1 public API
-can still change from actually using it.
+M7 supplies `examples/tinyworld`, kept in this repository but outside the
+installed library. Lira continuously crosses between the forest edge and the
+moonlit clearing. Walks ask the forest for a probability-based response;
+poison reschedules interval strikes; and each arrival queues `Rest` against its
+destination clearing. `Rest` owns moonlit potion healing, asks its targeted
+game-specific `Pathing` service for the nearest POI and connecting forest, and
+schedules the next walk against that forest. Clearing entities contain no
+navigation policy. The
+external-command replay test uses only public Layer 1. Two independent
+one-million-tick runs produced the same final HP of 20, 191,236-entry journal,
+7,358 potion uses, and SHA-256
+`cb4c08c2bab9c7c4c388ac3a71208da36d5f241792ef4006c849eaaa2a65958e`.
+
+Next is M8, the separate optional events layer. Its intents, event grouping,
+and resolvers must add simultaneity without making Layer 1 depend on it.
 
 ---
 
@@ -2353,7 +2436,7 @@ Losing the reasoning is the only real cost of overwriting a document.
 |---|---|---|
 | **Sampled/geometric waits** replace per-tick rolls; one queue entry instead of thousands. | **Per-tick rolling is the default.** Sampled waits available, not the pattern. | Sampling is valid only while `p` is constant. `p` depends on Char *and* environment stats, which change often; resampling churn eats the savings. Per-tick is also far easier to reason about. The *ability* to schedule far ahead is kept — sleep-until-dawn needs it. |
 | **`Action` is data only**, behaviour looked up by `kind` in a registry, so it can be a Postgres row. | **`Action` is an object with `process()`.** | The library is a set of interfaces; an object is the natural shape. The serialisation concern is real but belongs to the *store*, via a consumer-supplied `encode`/`decode` pair, and does not exist at all for the in-memory store. |
-| **`target` should be a first-class core field** (argued mid-session), driving event-key derivation and cascade cancels. | **`target` is game payload.** | The engine never reads it. Environments open events explicitly, so no key derivation is needed. Fails the "does the engine read it?" test. |
+| **`target` should drive core event-key derivation and cascade cancels**; later a mandatory or nullable `BaseAction.target_id` was considered. | **Target is game payload; a directed game defines non-null `GameAction.target_id`.** | Tinyworld needs every action directed, but foliot does not. A game-owned base gives `Walk`, `Rest`, and `Poison` one mandatory shape while targetless or multi-target simulations invent nothing. Nullable core target pays the API/schema cost without guaranteeing direction. The engine does not resolve targets, derive event keys, change RNG identity, or cascade cancellation. |
 | **Rendezvous (§8.1) is unresolved and blocks the registry.** | **Resolved: Option B.** Environments open events and enrol participants; `Event` is persisted. | The game's environment-as-event-spawner design answers it directly. Option A (symmetric derivation) remains available for incidental interactions. |
 | **Per-entity RNG recommended but unconfirmed**; owner preferred a global RNG. | **Decided: per-entity, counter-based.** | The Ivan/Petra example (§9.2): a global stream couples unrelated fights through a hidden cursor, breaking per-character isolation, crash recovery and any reordering. Cost objection answered by measurement (§9.3) — 1.6% of a core. |
 | **`world_seed` comes from the clock at world creation.** | **Generate one 128-bit seed from secure OS randomness and persist it for the lifetime of the one shared world.** | A clock value is guessable from the approximate creation time. That contradicts the intended unpredictability of future outcomes, especially in a permanent shared world. Deterministic replay needs a stable stored seed, not a predictable one. |
@@ -2365,7 +2448,7 @@ Losing the reasoning is the only real cost of overwriting a document.
 | **Action granularity is open**: is one action one narrative beat? | **Intermediate decision:** the *activity* is the narrative beat and its actions are machinery; later superseded by the no-groups decision below. | This answer produced the proposed `group_id`. §10.3 later established that a walk is one queued action, removing the machinery and the bundle together; the current answer is §6.3: the suspendable action itself is the narrative beat. |
 | A **reaction pass** may be needed so targeted entities can act. | **Not needed.** | The environment rolls inside the walking Char's own decide, and schedules the resulting event for the next tick. The pipeline stays single-pass. |
 | Intents/events/resolvers are **the framework layer** (core, central). | **Layer 2 — a separate, optional module.** | Layer 1 must be complete and useful alone, or foliot is a framework with a mandatory opinion rather than a library. Layer 2 still earns inclusion because it adds simultaneity. |
-| `docs/reference/protocols-draft.py` is the reference shape. | **Superseded, then deleted at M1.** | `Action` changed shape entirely (§7.1), `target` is out, and the two-layer split changed what belongs where. Keeping it cost a lint exclusion and left a wrong shape in the tree for someone to copy. Its two surviving ideas — solo-intent keys and `source_action_id` — are now in §10.5, and `git show 1d22a00:docs/reference/protocols-draft.py` has the rest. Deleting a file is not losing it; failing to extract its reasoning first would have been. |
+| `docs/reference/protocols-draft.py` is the reference shape. | **Superseded, then deleted at M1.** | `Action` changed shape entirely (§7.1), the draft assigned core behaviour to targets, and the two-layer split changed what belongs where. Keeping it cost a lint exclusion and left a wrong shape in the tree for someone to copy. Its two surviving ideas — solo-intent keys and `source_action_id` — are now in §10.5, and `git show 1d22a00:docs/reference/protocols-draft.py` has the rest. Deleting a file is not losing it; failing to extract its reasoning first would have been. |
 | **`mypy --strict`** is the type checker (§12.2). | **`basedpyright` in strict mode.** | Two behaviours mypy does not offer, both demonstrated during M0. `enableTypeIgnoreComments = false` makes `# type: ignore` stop silencing anything, so a suppression cannot be smuggled in. And `reportMatchNotExhaustive` names the unhandled member when a `match` misses a case — which is what turns adding an `ActionState` member into a compile error at every call site instead of a silent fallthrough. Corollary rule: a `case _:` branch, *even one that raises*, disables that check completely — verified, zero errors reported — so catch-alls are banned. |
 | **`requires-python = ">=3.11"`** — widest reach; PEP 695 buys foliot little because its protocols are not generic. | **`>=3.12`.** | Reversed after reading a mature in-house Python codebase whose style the owner wants to match. PEP 695 (`type Tick = int`, `class Store[A](Protocol):`) and `@typing.override` are the visible part of that style, and `override` cannot be had on 3.11 without `typing_extensions` — a dependency, which is forbidden. Cost: Debian 12's system Python (3.11) is excluded; Ubuntu 24.04 LTS (3.12) is not. The floor is enforced mechanically rather than by care — ruff infers its target from `requires-python`, so 3.13+ syntax fails to lint on a 3.14 dev machine (verified with PEP 696 defaults). |
 | **Tombstoning, not removal** — mark cancelled, skip on pop, keep the audit trail. | **Removal.** A done or cancelled action is deleted; only `active` and `suspended` exist. | The audit argument does not survive §15's conclusion that history belongs in the journal and the queue stays small and hot. Under the later single-runner decision, a committed deletion need only exclude the action from subsequent `due(...)` snapshots; foliot does not promise to invalidate arbitrary Python references retained by user code. |

@@ -182,8 +182,9 @@ publishes none of its staged queue, binding, log, or clock changes.
 - Run RNG stability in real subprocesses with different `PYTHONHASHSEED`
   values; two instances inside one interpreter cannot expose salted hashing.
 - `examples/tinyworld` is a test in disguise (§12.1): it is the only honest
-  check that the public API is pleasant, and it must be written while the API
-  can still change.
+  check that the public API is pleasant. Run it as an external subprocess
+  rather than adding the repository root to pytest's import path; the `src/`
+  layout must keep protecting against accidental local imports.
 
 ## Cross-references
 

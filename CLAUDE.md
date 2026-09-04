@@ -20,8 +20,8 @@ settled.
 ## What foliot is
 
 A clock, a queue, a way to look up what to run, and a source of
-addressable randomness. It has never heard of a target, a location, an
-environment, an activity, or combat.
+addressable randomness. It has never heard of a target, location,
+environment, activity, or combat rule.
 
 The library's value is in five guarantees, not in its object graph:
 
@@ -43,13 +43,14 @@ parallel execution.
 
 **This repo is the library only.** It is consumed by a separate
 zero-player game project, but it must not know that game exists — no
-characters, no HP, no items, no combat rules, no inventory, no targets.
+characters, no HP, no items, no combat rules, no inventory, and no targets.
 If a design question can only be answered by reference to a specific
 game, it is out of scope here.
 
 **The membership test for anything in `src/foliot/`:** *does the engine
-read it?* If not, it is game payload. This is how `target` was ruled out
-even though every game action has one (§3).
+read or enforce it?* If not, it is game payload. A game can make `target_id`
+mandatory once in its own `GameAction(BaseAction)` without putting target
+semantics into every simulation (§3, §7.2).
 
 **The membership test for a feature:** *does it add a guarantee the
 consumer cannot easily provide themselves?* If it is merely vocabulary
@@ -72,7 +73,7 @@ a mandatory opinion. Do not let layer 2 concepts leak downward.
 
 `docs/reference/protocols-draft.py` was deleted at M1. Its shape was
 wrong in every load-bearing way — data-only actions with a `kind`
-registry, `target` as a core field, `Any` where the world type belongs —
+registry, core-owned target behaviour, `Any` where the world type belongs —
 and keeping it meant keeping a wrong shape in the tree for someone to
 copy. The two ideas worth having are in §10.5; the rest is in git
 (`git show 1d22a00:docs/reference/protocols-draft.py`).
@@ -91,6 +92,16 @@ fixed monotonic cadence; an overrun skips missed wall slots but never logical
 ticks; every overrun emits one operational warning; downtime pauses simulation
 time; and `RealtimeDriver` runs until the application interrupts it. Its public
 constructor exposes only `tick_seconds`; clock and sleep seams stay private.
+
+M7 is the in-repository `examples/tinyworld` public-API proof. Its game-owned
+`GameAction(BaseAction)` makes non-null `target_id` mandatory for every
+Tinyworld action. `Walk` targets the forest while carrying a separate
+destination clearing; arrival queues `Rest` against that clearing, and `Rest`
+owns healing and asks game-specific `Pathing` for both the nearest POI and its
+connecting environment before the next walk. Clearing entities contain no
+navigation policy. Only a moonlit-clearing rest may heal. The fixed-seed
+example has completed two independent one-million-tick runs with identical
+results. M8's optional event layer is next.
 
 Everything else in v1's open list is now settled. Immediate milestone-level
 interface choices may still be called out under §18's "Immediate next work";

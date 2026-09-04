@@ -51,8 +51,8 @@ ban-relative-imports = "all"
 typeCheckingMode = "strict"
 # The FLOOR, not the dev interpreter: 3.14 must not smuggle in 3.13+ syntax.
 pythonVersion = "3.12"
-# Test fakes are part of the checked contract. Add "examples" at M7.
-include = ["src", "tests"]
+# Tests and examples are consumers of the public contracts, so type-check them.
+include = ["src", "tests", "examples"]
 venvPath = "."
 venv = ".venv"
 # A checker you can silence is a checker you will silence.

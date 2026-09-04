@@ -25,6 +25,7 @@ class ExampleAction(BaseAction[object]):
 def test_new_action_should_have_a_complete_unbound_state() -> None:
     action = ExampleAction()
 
+    assert action.entity_id == EntityId("ivan")
     assert action.binding == Unbound()
     with pytest.raises(RuntimeError, match="unbound action has no seq"):
         _ = action.seq

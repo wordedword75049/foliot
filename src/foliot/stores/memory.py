@@ -294,7 +294,7 @@ def _commit[W](state: _MemoryState[W], txn: _MemoryTxn[W]) -> None:
     actions_before = state.actions.copy()
     scheduled_before = {due_tick: bucket.copy() for due_tick, bucket in state.scheduled.items()}
     recurring_before = state.recurring.copy()
-    logs_before = state.logs.copy()
+    logs_length_before = len(state.logs)
     bindings_before = {
         id(action): (action, action.binding)
         for action in (*state.actions.values(), *txn.touched_actions)
@@ -322,7 +322,7 @@ def _commit[W](state: _MemoryState[W], txn: _MemoryTxn[W]) -> None:
         state.actions = actions_before
         state.scheduled = scheduled_before
         state.recurring = recurring_before
-        state.logs = logs_before
+        del state.logs[logs_length_before:]
         state.next_seq = next_seq_before
         state.current_tick = tick_before
         for action, binding in bindings_before.values():

@@ -1,8 +1,8 @@
 """foliot -- a deterministic tick-driven simulation core.
 
 A clock, a queue of scheduled things, a way to look up what to run, and a
-source of addressable randomness. It has never heard of a target, a location,
-an environment, an activity, or combat.
+source of addressable randomness. It has never heard of a target, location,
+environment, activity, or combat rule.
 
 The value is in five guarantees, not in the object graph:
 
