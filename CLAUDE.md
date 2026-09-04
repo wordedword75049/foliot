@@ -79,16 +79,18 @@ copy. The two ideas worth having are in §10.5; the rest is in git
 
 ## Open questions — ask, do not decide
 
-Four architectural questions remain genuinely undecided. Raise them; do not
+Two architectural questions remain genuinely undecided. Raise them; do not
 settle them in a commit:
 
-1. **Catch-up policy** (§4.3) — pin world time to wall time, or let it
-   lag. Not blocking until `RealtimeDriver` (M6).
-2. **Downtime handling** (§4.4) — fast-forward, compress, or shift the
-   world clock.
-3. **Log/journal table design** (§15) — the largest table, and in a ZPG
+1. **Log/journal table design** (§15) — the largest table, and in a ZPG
    the log *is* the product.
-4. **Flask vs FastAPI** — irrelevant to the library; deferrable forever.
+2. **Flask vs FastAPI** — irrelevant to the library; deferrable forever.
+
+M6 closed realtime timing: the first tick is immediate; targets stay on a
+fixed monotonic cadence; an overrun skips missed wall slots but never logical
+ticks; every overrun emits one operational warning; downtime pauses simulation
+time; and `RealtimeDriver` runs until the application interrupts it. Its public
+constructor exposes only `tick_seconds`; clock and sleep seams stay private.
 
 Everything else in v1's open list is now settled. Immediate milestone-level
 interface choices may still be called out under §18's "Immediate next work";
@@ -146,9 +148,10 @@ one should be deleted rather than obeyed.
   reasoning with numbers.
 - **Small, reviewable steps.** I am learning library authoring; a large
   correct diff teaches me less than a small one I can follow.
-- **I run the commands.** For `uv init`, `uv add`, `git` and the like,
-  tell me what to run and why — don't run it for me. Editing files
-  directly is fine.
+- **Verification can be delegated.** After I approve an implementation, you
+  may run its `uv` formatting, lint, type-check, and test commands and report
+  the results. Ask before dependency changes, publishing, or other commands
+  that expand scope.
 - **Ask before scope grows.** New files, new dependencies, new
   abstractions: check first. Dependencies especially.
 

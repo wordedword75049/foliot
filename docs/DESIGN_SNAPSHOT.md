@@ -161,8 +161,11 @@ the hard way, in production, at tick four million.
    seed; get byte-identical output.
 2. **Reordering the queue cannot change outcomes.** Process a tick's due
    actions in any iteration order and the world lands in the same state.
-3. **The clock does not drift.** Tick *n* happens at
-   `start + n · duration`, not `start + n · duration + nε`.
+3. **The realtime cadence does not drift.** Tick starts stay on a fixed grid
+   of `start + k · duration`, so ordinary processing overhead never accumulates
+   into `nε`. If processing overruns a grid slot, that wall-clock slot is
+   skipped rather than replayed; logical tick numbers remain consecutive and
+   may therefore fall behind real elapsed time (§4.3).
 4. **Nothing pending is lost, and nothing is applied twice.** The tick is
    the unit of atomicity (§8).
 5. **Time is injectable.** Ten million ticks run in a unit test in under
@@ -228,16 +231,32 @@ instrumentation, interpreter. The real period is `1.000 + ε`, not
 `1.000`. At ε = 2 ms that is ~173 seconds lost per day; after a month the
 world clock is roughly ninety minutes behind wall time, silently.
 
-Target fixed wall-clock moments so errors do not compound:
+Target fixed wall-clock moments so errors do not compound. After a normal tick,
+wait for its next absolute grid boundary. After an overrun, wait for the first
+grid boundary still in the future rather than running missed logical ticks
+back-to-back (§4.3). `RealtimeDriver` processes the first unfinished tick
+immediately; that start establishes the cadence anchor:
 
 ```python
-start = time.monotonic()
+cadence_start = time.monotonic()
+process_tick()
+slot = 1
+
 while True:
-    process_tick(n)
-    n += 1
-    deadline = start + n * TICK_DURATION
-    time.sleep(max(0, deadline - time.monotonic()))
+    now = time.monotonic()
+    deadline = cadence_start + slot * TICK_DURATION
+    while deadline < now:
+        slot += 1  # skip a missed wall-clock slot
+        deadline = cadence_start + slot * TICK_DURATION
+    time.sleep(deadline - now)
+    process_tick()
+    slot += 1
 ```
+
+Recompute each target from `cadence_start + slot * duration`; do not repeatedly
+add `duration` to the previous deadline. The fixed anchor prevents both
+processing overhead and floating-point addition error from accumulating into
+cadence drift.
 
 Use `time.monotonic()`, never `time.time()` — the latter jumps on NTP
 correction and can move backwards.
@@ -259,6 +278,25 @@ sim.run(RealtimeDriver(tick_seconds=1.0))  # production
 sim.run(ManualDriver(until_tick=10_000_000))  # tests, fast-forward
 ```
 
+`RealtimeDriver.tick_seconds` accepts a positive finite `int` or `float`, so
+fractions such as `0.5` and durations longer than one second are both valid.
+This changes only wall-clock pacing: logical ticks and every `due_tick` remain
+integers. Booleans, zero, negative numbers, infinity, and `NaN` are rejected.
+There is no arbitrary maximum duration.
+
+The public constructor exposes only `tick_seconds`. The real monotonic clock
+and sleeper sit behind private methods so foliot's own tests can substitute a
+fake-time subclass and advance hours instantly. There is no public `Clock`
+protocol and no public `clock=` or `sleep=` argument; those private methods are
+not a consumer extension point or a compatibility promise.
+
+`RealtimeDriver` is continuous: its `should_continue()` always returns true.
+It has no `stop()`, stop callback, or `until_tick`. Ctrl+C, a service shutdown
+signal, or another external interruption ends `Simulation.run()`; the
+surrounding application owns process lifecycle. Tick atomicity means a
+completed tick remains committed and an interrupted tick remains the next
+unfinished tick after restart.
+
 `ManualDriver.until_tick` is **inclusive**. If the next unfinished tick is 90,
 running with `until_tick=100` processes ticks 90 through 100 and leaves
 `current_tick()` at 101. Therefore an action processed at tick 90 that
@@ -274,38 +312,66 @@ loop makes the library untestable, and that is felt immediately.
 **The division of labour: `process_tick()` never waits.** It does one
 tick's work and returns. Deciding *when* the next call happens belongs
 entirely to the driver — immediately for `ManualDriver`, at
-`start + n * tick_duration` for `RealtimeDriver` (§4.1, absolute targets,
-never "sleep the rest of the second"). If waiting lives inside the work,
+`start + slot * tick_duration` for `RealtimeDriver`, where slot 0 is the
+immediate first tick and missed wall slots may be skipped (§4.1, absolute
+targets, never a new relative duration measured from when processing
+finished). If waiting lives inside the work,
 the two drivers stop being interchangeable and a test cannot outrun the
 clock, which is the one thing this split exists to allow.
 
-### 4.3 Catch-up policy — **OPEN**
+### 4.3 Overrun policy: skip wall slots, not logical ticks — **DECIDED**
 
-When a tick takes longer than a tick, `max(0, ...)` returns zero and the
-system is behind. Two policies, both defensible:
+The owner does not require one logical tick to equal one elapsed wall-clock
+second under overload. Game rules record and compare ticks; real time only
+paces them. Therefore foliot does **not** run back-to-back catch-up ticks.
 
-| Policy | Behaviour | Failure mode |
-|---|---|---|
-| **Catch up** | Run ticks back-to-back until caught up; world time stays pinned to wall time. | Under sustained overload the catch-up work causes more lag — a death spiral. |
-| **Let it lag** | World time falls permanently behind real time. Smooth, no spikes. | "5 minutes ago" in the log stops meaning 5 minutes ago in reality. Diverges slowly and invisibly. |
+With one-second pacing, if tick 10 starts at `10.0` and finishes at `11.4`,
+the `11.0` wall slot is already gone. The driver waits `0.6` seconds and starts
+logical tick 11 at the next cadence boundary, `12.0`:
 
-A hybrid is possible: catch up with a bounded budget (never more than N
-ticks back-to-back) plus an alert when lag exceeds a threshold. This
-leaks into the loop structure, so it needs deciding before
-`RealtimeDriver` is finalised. **Not blocking M1–M4**, since `ManualDriver`
-has no such notion.
+```text
+10.0  tick 10 starts
+11.0  missed while tick 10 is still processing
+11.4  tick 10 finishes
+12.0  tick 11 starts
+```
 
-### 4.4 Downtime handling — **OPEN**
+No logical tick is skipped: an action due at tick 11 still runs at tick 11.
+Only an unavailable wall-clock slot is skipped. This prevents a catch-up death
+spiral and keeps starts aligned to the original absolute cadence, at the
+accepted cost that ten simulation ticks may take more than ten real seconds
+under overload.
 
-After four hours of downtime, what happens?
+Overruns must be visible operationally. `RealtimeDriver` measures tick
+processing time and how many cadence slots were missed, then reports overruns
+through ordinary Python logging, outside the deterministic game journal. These
+measurements are not persisted through `Store`: the consuming application
+decides whether its logging configuration sends them to a terminal, file,
+monitoring service, database, or nowhere.
 
-- **Fast-forward** — replay every missed tick. Expensive but faithful.
-- **Compress** — summarise the gap into a digest event.
-- **Shift the world clock** — declare no in-fiction time passed.
+The reporting rule is deliberately small: each completed logical tick that
+causes one or more cadence slots to be skipped produces exactly one `WARNING`.
+The record includes the logical tick, its processing time, the configured tick
+duration, and the number of skipped slots. A normal tick produces no timing
+log. Foliot provides no threshold, rate limiting, aggregation, or persistence;
+the consuming application's logging configuration may add any of those.
 
-Related and settled: **`current_tick` must be persisted**, since on
-restart the engine needs to know whether it is resuming or
-fast-forwarding. That falls out of §8 for free.
+### 4.4 Downtime pauses simulation time — **DECIDED**
+
+Wall-clock time while the simulation runner is stopped does not become
+logical ticks. If the process stops after committing tick 100, the store says
+that 101 is the next unfinished tick. Whether the process restarts four hours
+or four days later, it creates a fresh realtime cadence and continues with tick
+101. An action due at tick 120 remains nineteen processed ticks away.
+
+Foliot neither records a realtime cadence anchor in `Store` nor calculates a
+downtime gap. A monotonic-clock value is meaningful only inside the process
+that created it. A game that deliberately wants to advance through many
+logical ticks may still run a `ManualDriver`; restart never does this
+implicitly.
+
+**`current_tick` must be persisted**, because it identifies the next unfinished
+tick after restart. That already falls out of the tick transaction (§8).
 
 ---
 
@@ -1872,7 +1938,7 @@ Sequenced so each milestone is independently testable.
 | M3 | **Done; 36 tests, Ruff, and basedpyright verified.** `rng.py` — secure seed helper, counter-based streams, stable hashing | §9 | Manual unsigned 128-bit seeds; golden vectors and a real cross-`PYTHONHASHSEED` subprocess test lock replay. |
 | M4 | **Done; 50 tests, Ruff, and basedpyright verified.** `stores/memory.py` — the built-in reference/test implementation of the storage chassis | M1, M2 | `Store` / `Txn` protocols already define the chassis. M4 proves them with `due_tick` buckets, deletion, `seq` ordering, single-runner enforcement, and staged commit/rollback for foliot-owned state. |
 | M5 | **Done; 64 tests, Ruff, and basedpyright verified.** `engine.py` + `ManualDriver`; `MemoryStore(initial_actions=...)` bootstrap convenience | M1–M4, §8 | The two-phase tick loop, deterministic apply order, isolated visible handler failures, tick-fatal effect failures, context validation, and inclusive manual fast-forward. Initial in-memory actions are admitted without consuming an artificial tick; this does not widen the `Store` protocol. |
-| M6 | `RealtimeDriver` | §4.3 catch-up policy | Manual first — it is what makes M5 testable. |
+| M6 | **Done; 86 tests, Ruff, and basedpyright verified.** `RealtimeDriver` | §§4.1, 4.3, 4.4 | Its only public input is positive finite whole or fractional `tick_seconds`; clock/sleep seams stay private. The first tick runs immediately on a fresh cadence. Missed wall-clock slots are skipped; logical ticks are not. Each overrunning tick emits one operational `WARNING`; foliot does not persist or aggregate timing measurements. Downtime pauses simulation time. The driver runs until external interruption and owns no stop mechanism. |
 | M7 | `examples/tinyworld` | M5 | Written while the API can still change. |
 | M8 | Layer 2: `events/` — intents, grouping, resolvers | M5, §10 | Optional module. Layer 1 must work without it. |
 
@@ -2208,18 +2274,14 @@ useful here.
 
 ### Open, needs deciding
 
-1. **Catch-up policy** (§4.3) — pin world time to wall time vs. allow
-   lag. Not blocking until `RealtimeDriver` (M6).
-2. **Downtime handling** (§4.4) — fast-forward, compress, or shift the
-   world clock.
-3. **Log/journal table design** (§15) — the largest table, and it *is*
+1. **Log/journal table design** (§15) — the largest table, and it *is*
    the product. Wants deliberate design.
-4. **Flask vs. FastAPI** — deferrable indefinitely; irrelevant to the
+2. **Flask vs. FastAPI** — deferrable indefinitely; irrelevant to the
    library.
 
 ### Immediate next work
 
-M0 through M5 are **done**. M2 provides mandatory `BaseAction`,
+M0 through M6 are **done**. M2 provides mandatory `BaseAction`,
 `Unbound | Bound`, `Active | Suspended`, stable binding/rescheduling, and the
 pause shift with `on_resume(paused_for)` (§6.4). M3 provides explicit secure
 world-seed creation, stable per-action counter streams, unbiased bounded
@@ -2269,8 +2331,16 @@ the tick. Ruff, basedpyright strict over `src/` and `tests/`, and all 64 tests
 pass, including reversed due-order, retry-without-duplication, and inclusive
 tick-100 boundary tests.
 
-Next is M6, `RealtimeDriver`, but its catch-up policy remains deliberately open
-and must be discussed before implementation (§4.3).
+M6 supplies `RealtimeDriver`. Its first tick is immediate and establishes an
+absolute monotonic cadence; each later target is recomputed from the anchor so
+fractional durations do not accumulate drift. Overruns skip wall slots but not
+logical ticks and emit one operational `WARNING` with duration and skipped-slot
+count. Timing measurements never enter `Store`; downtime pauses simulation
+time; the driver owns no stop mechanism; and clock/sleep seams remain private.
+The fake-time suite verifies a full simulated hour without real sleeping.
+
+Next is M7, `examples/tinyworld`, written while the complete Layer 1 public API
+can still change from actually using it.
 
 ---
 
@@ -2287,6 +2357,7 @@ Losing the reasoning is the only real cost of overwriting a document.
 | **Rendezvous (§8.1) is unresolved and blocks the registry.** | **Resolved: Option B.** Environments open events and enrol participants; `Event` is persisted. | The game's environment-as-event-spawner design answers it directly. Option A (symmetric derivation) remains available for incidental interactions. |
 | **Per-entity RNG recommended but unconfirmed**; owner preferred a global RNG. | **Decided: per-entity, counter-based.** | The Ivan/Petra example (§9.2): a global stream couples unrelated fights through a hidden cursor, breaking per-character isolation, crash recovery and any reordering. Cost objection answered by measurement (§9.3) — 1.6% of a core. |
 | **`world_seed` comes from the clock at world creation.** | **Generate one 128-bit seed from secure OS randomness and persist it for the lifetime of the one shared world.** | A clock value is guessable from the approximate creation time. That contradicts the intended unpredictability of future outcomes, especially in a permanent shared world. Deterministic replay needs a stable stored seed, not a predictable one. |
+| **Logical tick `n` always starts at `start + n · tick_duration`; an overrun is followed by immediate catch-up ticks.** | **Starts remain on the driver's absolute cadence grid, but missed wall-clock slots are skipped; logical tick numbers are never skipped.** | Game rules use logical ticks, so replaying missed wall slots buys no simulation correctness and can create a catch-up death spiral. If tick 10 finishes at `11.4` on a one-second cadence, the driver waits the remaining `0.6` and starts logical tick 11 at `12.0`. The accepted cost is that the simulation can lag elapsed wall time under overload. |
 | **The in-memory tick transaction is a no-op.** | **Stage foliot-owned queue changes, bindings, logs, and the clock; publish them only on clean exit.** | Immediate writes survive a later exception while the clock stays put, so retrying the same tick can duplicate work. A memory store cannot generically roll back arbitrary mutations inside game-owned `W`; that separate boundary remains explicit rather than being hidden by the queue fix. |
 | **Foliot will ship a Postgres adapter as an extra at M9.** | **Foliot ships only `Store` / `Txn` protocols and the built-in `MemoryStore`; each game owns its durable adapter.** | Action payloads, schemas, transactions, codecs, and database libraries are game-specific. The same protocol supports Postgres, MariaDB, MySQL, a JSON file, or something else without pulling any of them into the core. `MemoryStore` is the dependency-free reference and testing bonus, not the production recommendation. |
 | `rng = Random(hash((world_seed, entity_id, tick, seq)))` | Stable hash / integer mixing; **never `hash()` on a string.** | `hash()` is salted per process (`PYTHONHASHSEED`), so v1's snippet silently breaks replay across a restart. |

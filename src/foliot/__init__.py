@@ -26,7 +26,7 @@ from foliot.actions import (
     Unbound,
 )
 from foliot.context import TickContext
-from foliot.drivers import Driver, ManualDriver
+from foliot.drivers import Driver, ManualDriver, RealtimeDriver
 from foliot.effects import Effect
 from foliot.engine import Simulation
 from foliot.ids import EntityId, SuspensionId, Tick
@@ -44,6 +44,7 @@ __all__ = [
     "EntityId",
     "ManualDriver",
     "MemoryStore",
+    "RealtimeDriver",
     "Rng",
     "Simulation",
     "Store",

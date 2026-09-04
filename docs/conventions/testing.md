@@ -122,9 +122,11 @@ Three reasons, in ascending order of how much they would hurt here:
    `monkeypatch` means the seam was not used.
 
 **Never `freezegun`, and never a global time patch.** `ManualDriver` *is* the
-time control (§4.2), and building it before `RealtimeDriver` is a decided
-build-order rule (§13). Freezing the clock globally to test a clock is
-testing the patch.
+consumer-facing time control (§4.2), and building it before `RealtimeDriver`
+is a decided build-order rule (§13). Test `RealtimeDriver`'s own pacing maths
+with a private fake-time subclass that replaces its private clock and sleeper
+methods; do not expose those seams as public constructor arguments. Freezing
+the clock globally to test a clock is testing the patch.
 
 `ManualDriver(until_tick=n)` includes tick `n`. Starting with tick 90 as the
 next unfinished tick and running until 100 must process ticks 90 through 100,

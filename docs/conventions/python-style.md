@@ -105,9 +105,13 @@ replace its internal binding while preserving the game object's own fields
 error. Failure mode: rename a method on `BaseAction` and a subclass's
 override silently becomes dead code that never runs again.
 
-**Injected, never constructed.** Persistence, clock and randomness arrive
-through the constructor (§12.3). A class that reaches for a global is a
-class that cannot be tested at ten million ticks.
+**Core boundaries are injected, never constructed.** `Simulation` receives its
+`Store` and `Driver`; handlers receive randomness through `TickContext`
+(§12.3). `RealtimeDriver` is the one stdlib wall-clock adapter: it calls
+`time.monotonic()` and `time.sleep()` behind private methods that foliot's own
+tests replace with a private fake-time subclass. It exposes no public clock or
+sleep dependency. Reaching around these boundaries for another global makes
+the code impossible to test at ten million ticks.
 
 ## Public API surface
 
