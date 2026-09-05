@@ -172,7 +172,7 @@ class Simulation[W]:
     Args:
         store: Consumer-supplied persistence adapter for world type `W`.
         events: Optional Event collaborator using the exact same store.
-        finalizer: Optional game policy run after normal effects and before
+        finalizer: Optional application policy run after normal effects and before
             commit.
 
     Raises:

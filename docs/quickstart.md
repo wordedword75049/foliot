@@ -10,7 +10,7 @@ Foliot requires Python 3.12 or newer and has no runtime dependencies.
 
 ## Define the world
 
-The world is an ordinary game-owned Python object:
+The world is an ordinary application-owned Python object:
 
 ```python
 from dataclasses import dataclass

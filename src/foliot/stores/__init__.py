@@ -1,7 +1,7 @@
 """Structural persistence contracts and the in-memory reference store.
 
-foliot owns *when* to save; the game owns *how* and *where*. The library ships
-no database and no dependency, but it does not leave the timing to the game,
+foliot owns *when* to save; the application owns *how* and *where*. The library ships
+no database and no dependency, but it does not leave the timing to the application,
 because the timing is the hard part and only the engine knows it.
 
 Two protocols, because reading is always legal and writing is not. The only way
@@ -28,13 +28,13 @@ class Txn[W](Protocol):
     Implementations should collect these calls and flush set-based batches at
     commit rather than issuing one database round-trip per operation.
 
-    Nothing here is a game verb. There is no `damage`, no `hp`. Game state
+    Nothing here is a domain verb. There is no `damage`, no `hp`. Application state
     changes travel as `Effect` objects the engine only knows how to `apply`.
     """
 
     @property
     def world(self) -> W:
-        """The game's world, reached through this tick's transaction.
+        """The application's state, reached through this tick's transaction.
 
         The engine calls `effect.apply(txn.world)`, so an effect's write lands
         in the same transaction as the queue by construction. That turns the
@@ -64,7 +64,7 @@ class Txn[W](Protocol):
         """Remove every action owned by one entity in this transaction.
 
         This includes active, suspended, and newly scheduled actions. It never
-        follows game-owned target fields and never closes an Event implicitly.
+        follows application-owned target fields and never closes an Event implicitly.
         """
         ...
 

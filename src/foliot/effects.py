@@ -1,4 +1,4 @@
-"""Structural contract for game-defined world mutations."""
+"""Structural contract for application-defined state mutations."""
 
 from typing import Protocol
 
@@ -22,5 +22,5 @@ class Effect[W](Protocol):
     """
 
     def apply(self, world: W, /) -> None:
-        """Apply this mutation to the transaction's game-owned world."""
+        """Apply this mutation to the transaction's application-owned state."""
         ...

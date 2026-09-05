@@ -14,7 +14,7 @@ successful `Txn.schedule(...)` changes it to `Bound(seq, Active(due_tick))`.
 
 `seq` is permanent. Rescheduling, suspending, and resuming replace the state
 without changing the sequence number. A durable adapter must persist and
-restore both the binding and every game-defined subclass field.
+restore both the binding and every application-defined subclass field.
 
 ## Scheduled and recurring actions
 
@@ -34,7 +34,7 @@ def process(self, ctx: TickContext[World], /) -> None:
         ctx.schedule(self, next_strike)
 ```
 
-The same poison object—and therefore the same `seq` and game payload—moves to
+The same poison object—and therefore the same `seq` and domain payload—moves to
 the new deadline.
 
 ## Collect first, apply later
@@ -60,7 +60,7 @@ as hunger or poison continues.
 A suspended action remembers when it paused, who owes the wake-up, and its
 old deadline. Resuming by the same handle shifts the stored deadline forward
 by the exact pause duration. Override `on_resume(paused_for)` when the action
-also has a game-owned deadline:
+also has an application-owned deadline:
 
 ```python
 @override
@@ -84,7 +84,7 @@ needed to apply their mutation.
 ## Post-effect finalization
 
 An optional `TickFinalizer` sees the world after ordinary and Event effects.
-It is the place for game rules such as death:
+It is the place for domain rules such as death:
 
 ```python
 class DeathFinalizer:

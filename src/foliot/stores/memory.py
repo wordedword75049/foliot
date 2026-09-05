@@ -1,7 +1,7 @@
 """Dependency-free reference storage for tests and quickstarts.
 
 `MemoryStore` implements the same `Store` / `Txn` behavior a consumer-owned
-durable adapter must provide, but keeps the actual game action objects in
+durable adapter must provide, but keeps the actual application action objects in
 Python memory. It is intentionally single-runner and disappears with the
 process; it is a reference and testing bonus, not a production database.
 """
@@ -80,16 +80,16 @@ class _MemoryState[W]:
 class MemoryStore[W]:
     """A single-runner, in-memory implementation of `Store[W]`.
 
-    Actions remain their original game subclass objects; no codec, registry,
+    Actions remain their original application subclass objects; no codec, registry,
     or serialization is involved. Tick transactions stage foliot-owned state
-    and publish it only on a clean exit. The supplied game-owned `world` is
+    and publish it only on a clean exit. The supplied application-owned `world` is
     exposed directly through `Txn.world` and cannot be generically rolled back.
     Optional `initial_actions` are admitted during construction without
     advancing the clock; this concrete bootstrap convenience is deliberately
     absent from the engine-facing `Store` protocol.
 
     Args:
-        world: Mutable game-owned world exposed through each transaction.
+        world: Mutable application-owned state exposed through each transaction.
         world_seed: Persisted unsigned 128-bit seed.
         current_tick: Next unfinished logical tick.
         initial_actions: Ordered `(action, due_tick)` pairs admitted without
@@ -103,7 +103,7 @@ class MemoryStore[W]:
 
     Note:
         Queue state, bindings, logs, and the clock roll back on failure. Direct
-        mutations of an arbitrary game-owned Python object cannot be rolled
+        mutations of an arbitrary application-owned Python object cannot be rolled
         back generically; stage world changes as effects.
     """
 

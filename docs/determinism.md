@@ -51,7 +51,7 @@ A durable simulation must preserve:
 
 - the world seed;
 - the current logical tick;
-- every action's permanent `seq`, state, owner, and game payload;
+- every action's permanent `seq`, state, owner, and domain payload;
 - every open Event and its exact current children;
 - external inputs in deterministic order.
 

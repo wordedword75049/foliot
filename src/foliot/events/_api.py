@@ -76,13 +76,13 @@ class _ReadContext:
 
 @dataclass(frozen=True, slots=True)
 class IntentRecord:
-    """One game Intent with routing metadata attached by foliot.
+    """One application Intent with routing metadata attached by foliot.
 
     Attributes:
         event_id: Event receiving the Intent.
         source_seq: Permanent sequence number of the producing EventAction.
         entity_id: Entity that made the decision.
-        intent: Opaque game-defined Intent object.
+        intent: Opaque application-defined Intent object.
     """
 
     event_id: EventId
@@ -99,7 +99,7 @@ class EventAction[W](BaseAction[W], ABC):
         event_id: Existing Event that expects this child action.
 
     Event actions are non-suspendable. Do not override `process`; implement
-    `decide` and return exactly one non-`None` game Intent.
+    `decide` and return exactly one non-`None` application Intent.
     """
 
     __slots__ = ("_event_id",)
@@ -131,13 +131,13 @@ class EventAction[W](BaseAction[W], ABC):
 
     @abstractmethod
     def decide(self, ctx: DecisionContext, /) -> object:
-        """Return exactly one game-defined Intent for the current round.
+        """Return exactly one application-defined Intent for the current round.
 
         Args:
             ctx: Tick and participant-specific deterministic RNG.
 
         Returns:
-            Any non-`None` game-defined Intent object.
+            Any non-`None` application-defined Intent object.
         """
         ...
 
@@ -241,7 +241,7 @@ class Outcome[W]:
         Args:
             *children: Non-empty set of fresh, unbound EventActions.
             due_tick: Strictly future tick shared by all next-round children.
-            effects: Game-defined mutations for the current round.
+            effects: Application-defined mutations for the current round.
             schedules: Additional `(action, due_tick)` requests.
             deletes: Existing actions to remove.
             log: Narrative lines to append in order.
@@ -280,7 +280,7 @@ class Outcome[W]:
         """End the Event after applying the described work.
 
         Args:
-            effects: Game-defined mutations for the final round.
+            effects: Application-defined mutations for the final round.
             schedules: Additional `(action, due_tick)` requests.
             deletes: Existing actions to remove.
             log: Narrative lines to append in order.
@@ -329,7 +329,7 @@ class Outcome[W]:
 
 
 class EventIdTemplate:
-    """Stable game-declared namespace for Event identifiers.
+    """Stable application-declared namespace for Event identifiers.
 
     Args:
         namespace: Non-empty, version-stable application namespace such as
@@ -380,7 +380,7 @@ class EventIdTemplate:
 
 
 class EntityIdTemplate:
-    """Stable game-declared namespace for Event-owned entity identifiers.
+    """Stable application-declared namespace for Event-owned entity identifiers.
 
     Args:
         namespace: Non-empty, version-stable application namespace such as
@@ -562,7 +562,7 @@ def open_event[W](ctx: TickContext[W], event: BaseEvent[W], due_tick: Tick, /) -
 
 
 def end_event[W](ctx: FinalizationContext[W], event_id: EventId, /) -> None:
-    """Stage Event closure from post-effect game finalization.
+    """Stage Event closure from post-effect application finalization.
 
     Closing removes the Event and its current or newly staged children, then
     resumes actions suspended by that Event id.

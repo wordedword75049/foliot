@@ -1,7 +1,7 @@
 # Contributing to foliot
 
 Thank you for helping improve foliot. The project favors small, explicit
-changes that preserve deterministic behavior and keep game concepts outside
+changes that preserve deterministic behavior and keep domain concepts outside
 the engine.
 
 ## Setup
@@ -28,13 +28,13 @@ Use `uv run ruff format` to apply formatting.
 
 ## Design rules
 
-- Every queued game action inherits `BaseAction`.
+- Every queued action inherits `BaseAction`.
 - External ports such as stores, effects, contexts, RNGs, and drivers use
   structural `Protocol` typing.
 - Keep public contexts narrow. Pass `ctx.rng` to a helper instead of passing
   the whole context.
-- Game nouns do not belong in foliot. The engine has no built-in HP, character,
-  target, location, or combat model.
+- Domain nouns do not belong in foliot. The engine has no built-in account,
+  character, target, location, inventory, or combat model.
 - Use PEP 695 generic syntax; the supported floor is Python 3.12.
 - Do not use `Any` in public signatures.
 - Use exhaustive `match` statements for closed state unions; do not add a
@@ -60,7 +60,7 @@ Important changes should prove the architectural property they affect:
 - an incomplete Event round retains exactly one copy of every current child;
 - Layer 1 behaves identically when the optional Event layer is unused.
 
-Test game actions directly with a tiny recording context whenever possible.
+Test application actions directly with a tiny recording context whenever possible.
 Use a full `Simulation` only when testing engine coordination.
 
 ## Documentation

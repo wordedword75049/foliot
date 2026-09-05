@@ -7,6 +7,11 @@ and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Broadened the public positioning from game-oriented language to
+  domain-agnostic persistent simulations.
+
 ## [0.1.0] - 2026-09-05
 
 ### Added

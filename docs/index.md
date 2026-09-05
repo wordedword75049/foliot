@@ -1,6 +1,6 @@
 # Documentation
 
-Foliot has one job: advance a game-owned world through deterministic,
+Foliot has one job: advance application-owned state through deterministic,
 transactional ticks. Start with the quickstart, then read only the concepts
 your simulation needs.
 

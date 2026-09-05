@@ -28,7 +28,7 @@ class EventMemoryStore[W]:
     transaction and publish only after a clean exit.
 
     Args:
-        world: Mutable game-owned world exposed through each transaction.
+        world: Mutable application-owned state exposed through each transaction.
         world_seed: Persisted unsigned 128-bit seed.
         current_tick: Next unfinished logical tick.
         initial_actions: Ordered `(action, due_tick)` pairs admitted without a
@@ -36,7 +36,7 @@ class EventMemoryStore[W]:
 
     Note:
         Like `MemoryStore`, this adapter cannot generically roll back direct
-        mutations of an arbitrary game-owned Python object. Stage mutations as
+        mutations of an arbitrary application-owned Python object. Stage mutations as
         effects.
     """
 

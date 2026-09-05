@@ -57,7 +57,7 @@ class TickContext[W](Protocol):
         ...
 
     def emit(self, effect: Effect[W], /) -> None:
-        """Stage a game-defined world mutation for the apply phase.
+        """Stage an application-defined state mutation for the apply phase.
 
         Args:
             effect: Object whose `apply(world)` method performs the mutation.
@@ -85,7 +85,7 @@ class TickContext[W](Protocol):
         iteration order.
 
         Args:
-            line: Complete game-facing narrative line. Foliot does not format
+            line: Complete application-facing journal line. Foliot does not format
                 or localize it.
         """
         ...
@@ -117,7 +117,7 @@ class TickContext[W](Protocol):
 class FinalizationContext[W](Protocol):
     """Collect lifecycle work after all normal effects have been applied.
 
-    It deliberately has no RNG or world property. The game receives the
+    It deliberately has no RNG or world property. The application receives the
     post-effect world as the other argument to `TickFinalizer.finalize`, while
     every requested write still travels through this collecting boundary.
     """
@@ -149,7 +149,7 @@ class FinalizationContext[W](Protocol):
 
 
 class TickFinalizer[W](Protocol):
-    """Optional game-owned policy run after a tick's normal effects.
+    """Optional application-owned policy run after a tick's normal effects.
 
     Use a finalizer for rules that depend on the combined post-effect world,
     such as death or cleanup. A raised exception aborts the tick transaction.

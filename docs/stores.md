@@ -32,7 +32,7 @@ order is convenient.
 
 ## Txn: writes valid inside one tick
 
-The transaction exposes the game world used by effects and operations for
+The transaction exposes the application state used by effects and operations for
 scheduling, deletion, suspension, resumption, and narrative logging.
 
 On clean context-manager exit, the adapter must atomically:
@@ -47,7 +47,7 @@ On exceptional exit, none of those changes may survive.
 
 ## PostgreSQL-shaped structure
 
-The exact schema belongs to the game, but the transaction boundary usually
+The exact schema belongs to the application, but the transaction boundary usually
 looks like this:
 
 ```python
@@ -76,7 +76,7 @@ class PostgresTickTransaction:
 ```
 
 This is illustrative pseudocode, not a required database API. In practice,
-`Txn.world` can be a game repository or unit-of-work object bound to that same
+`Txn.world` can be an application repository or unit-of-work object bound to that same
 connection, allowing `effect.apply(txn.world)` to write through the active
 transaction.
 
@@ -90,11 +90,11 @@ actions reschedule simultaneously.
 ## Action serialization
 
 Foliot does not prescribe JSON, pickle, ORM models, or a `kind` registry. The
-game knows its concrete action classes and payloads, so the game owns the codec.
+application knows its concrete action classes and payloads, so it owns the codec.
 Hydration must reconstruct the original subclass and then restore its
 `Bound(seq, state)` lifecycle data.
 
-Avoid Python pickle for untrusted or long-lived data. Explicit versioned game
+Avoid Python pickle for untrusted or long-lived data. Explicit versioned application
 payloads are easier to migrate safely.
 
 ## Domain queries stay outside the protocol

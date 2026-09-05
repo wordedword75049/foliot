@@ -91,10 +91,10 @@ def counter_rng(
 def event_resolution_rng(world_seed: int, event_id: str, tick: Tick, /) -> Rng:
     """Create one internal stream for shared Event resolution.
 
-    This is intentionally not re-exported. Games receive the resulting stream
+    This is intentionally not re-exported. Applications receive the resulting stream
     through `ResolutionContext`; they never construct or seed it themselves.
     Its separate BLAKE2 personalization makes collision with an action stream
-    impossible even if a game chooses matching textual identities.
+    impossible even if an application chooses matching textual identities.
     """
     _validate_world_seed(world_seed)
     digest = blake2b(

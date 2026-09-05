@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Foliot is a deterministic tick engine, not a game framework. It coordinates
-logical time, queued work, randomness, and persistence while leaving the world
+Foliot is a deterministic tick engine, not a domain framework. It coordinates
+logical time, queued work, randomness, and persistence while leaving the state
 model and every domain rule to the application.
 
 ## The boundary
@@ -46,7 +46,7 @@ Store.due(tick)
     │
     ├─ apply valid work in stable order inside Txn
     │
-    ├─ run optional game TickFinalizer
+    ├─ run optional application TickFinalizer
     │
     └─ commit world + queue + journal + next tick atomically
 ```
@@ -89,7 +89,7 @@ does not create a parallel engine or change ordinary action behavior.
 - One active simulation runner owns a world.
 - Foliot does not provide a database adapter.
 - Memory stores cannot generically roll back arbitrary mutations made directly
-  to a game-owned Python object. Use staged effects; durable adapters must use
+  to an application-owned Python object. Use staged effects; durable adapters must use
   transactional world writes.
 - External side effects such as email or HTTP calls cannot be rolled back by a
   database transaction. Applications should use an outbox or idempotency.

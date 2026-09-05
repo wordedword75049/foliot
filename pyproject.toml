@@ -1,7 +1,7 @@
 [project]
 name = "foliot"
 version = "0.1.0"
-description = "A deterministic tick-driven simulation core: durable queue, absolute deadlines, per-entity randomness."
+description = "A deterministic, transactional tick engine for persistent simulations."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -10,7 +10,14 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = []
-keywords = ["simulation", "scheduler", "tick", "deterministic", "event-queue"]
+keywords = [
+    "simulation",
+    "simulation-engine",
+    "scheduler",
+    "tick",
+    "deterministic",
+    "agent-based",
+]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
@@ -19,7 +26,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Topic :: Games/Entertainment :: Simulation",
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]

@@ -23,9 +23,9 @@ That makes Event state and ordinary queue state part of one transaction.
 Without this explicit collaborator, normal actions still work and foliot does
 not attempt Event resolution.
 
-## 1. Define game Intents
+## 1. Define application Intents
 
-Intents are ordinary game objects:
+Intents are ordinary application objects:
 
 ```python
 from dataclasses import dataclass
@@ -68,7 +68,7 @@ Do not override `process()`. `EventAction` provides the final bridge that calls
 `decide()` and registers exactly one Intent with the correct Event id and
 permanent source sequence number.
 
-`DecisionContext` exposes only `tick` and the participant action's RNG. Game
+`DecisionContext` exposes only `tick` and the participant action's RNG. Application
 objects referenced by the action may supply the tick-start statistics needed
 for the choice.
 
@@ -102,7 +102,7 @@ class Fight(BaseEvent[World]):
         )
 ```
 
-The concrete Event owns game rules and any temporary payload, such as the wolf.
+The concrete Event owns domain rules and any temporary payload, such as the wolf.
 `ResolutionContext` contains only the current tick and an Event-specific RNG.
 
 A continuing Outcome must provide at least one fresh, unbound child and one
@@ -164,7 +164,7 @@ application has already begun inside the transaction.
 ## Ending after effects
 
 Sometimes the Event cannot know it has ended until effects apply—for example,
-damage reduces a participant to zero HP. A game-owned `TickFinalizer` can call
+damage reduces a participant to zero HP. An application-owned `TickFinalizer` can call
 the explicit helper afterward:
 
 ```python

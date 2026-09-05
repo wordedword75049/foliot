@@ -1,13 +1,14 @@
 # foliot
 
-`foliot` is a small, deterministic simulation engine for worlds that advance
-in logical ticks.
+`foliot` is a small, deterministic, transactional tick engine for persistent
+simulations.
 
 It gives you a durable action queue, scheduled and recurring work, reproducible
 randomness, suspension and resumption, atomic ticks, real-time pacing, and an
 optional layer for simultaneous multi-entity events. It deliberately does not
-define characters, maps, combat, health, inventories, or quests. Those belong
-to your simulation.
+define a domain model or its rules. Applications can use it for games,
+agent-based models, virtual worlds, economies, ecosystems, logistics, and
+other stateful simulations while owning all domain state and behavior.
 
 > **Status:** pre-alpha. The core is tested and usable, but the public API may
 > still change before 1.0.
@@ -20,7 +21,7 @@ to your simulation.
   through one store transaction.
 - **Fast-forwardable:** use logical time to run millions of ticks without
   sleeping.
-- **Domain-agnostic:** your game owns its world model and rules.
+- **Domain-agnostic:** your application owns its state model and rules.
 - **Storage-agnostic:** implement two small protocols for PostgreSQL, MySQL,
   MariaDB, a file, or another backend.
 - **Dependency-free:** the installed library uses only the Python standard
@@ -93,8 +94,8 @@ changes its deadline without changing that identity.
 |---|---|
 | `ctx.schedule(action, 100)` | Run at tick 100. |
 | `ctx.schedule(action, None)` | Run every tick until `ctx.finish()`. |
-| `ctx.emit(effect)` | Apply a game-defined world change after decisions. |
-| `ctx.log(line)` | Append deterministic narrative output. |
+| `ctx.emit(effect)` | Apply an application-defined state change after decisions. |
+| `ctx.log(line)` | Append one deterministic journal line. |
 | `ctx.suspend(entity_id, by=handle)` | Pause that entity's suspendable actions. |
 | `ctx.finish()` | Remove the current action. |
 
@@ -116,10 +117,10 @@ store = EventMemoryStore(world, world_seed=1)
 simulation = Simulation(store, events=Events(store))
 ```
 
-Each `EventAction` returns one game-defined Intent. Once every expected
+Each `EventAction` returns one application-defined Intent. Once every expected
 participant has answered in the same tick, the concrete `BaseEvent` resolves
 the complete set into either `Outcome.continue_with(...)` or `Outcome.end(...)`.
-Combat formulas and lifecycle rules remain game code.
+Domain formulas and lifecycle rules remain application code.
 
 Run the complete example:
 

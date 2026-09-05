@@ -1,12 +1,12 @@
-"""Game actions with engine-owned lifecycle bookkeeping.
+"""Actions with engine-owned lifecycle bookkeeping.
 
-Every game action that enters foliot's queue inherits `BaseAction`. This is
+Every action that enters foliot's queue inherits `BaseAction`. This is
 deliberately different from the library's structural ports: binding, stable
-identity, and suspension are invariants every game needs and must implement in
-exactly the same way.
+identity, and suspension are simulation invariants that must have one
+implementation.
 
 An action always has a complete binding value. It starts `Unbound`; the store
-changes it to `Bound(seq, state)` on first successful admission. The same game
+changes it to `Bound(seq, state)` on first successful admission. The same
 object -- including all subclass fields -- survives every reschedule,
 suspension, and resume, and its `seq` never changes.
 """
@@ -65,7 +65,7 @@ type ActionState = Active | Suspended
 
 @dataclass(frozen=True, slots=True)
 class Unbound:
-    """A complete game action that has not entered the queue yet."""
+    """A complete action that has not entered the queue yet."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,11 +89,11 @@ type ActionBinding = Unbound | Bound
 
 
 class BaseAction[W](ABC):
-    """Mandatory blueprint for every game action entering foliot's queue.
+    """Mandatory blueprint for every action entering foliot's queue.
 
     The base owns only the lifecycle fields foliot needs. Subclasses keep all
-    game-owned payload -- target, poison damage, tick interval, arrival
-    deadline, and so on -- on the same object and implement `process()`.
+    application-owned payload -- target, amount, interval, domain deadline,
+    and so on -- on the same object and implement `process()`.
 
     Args:
         entity_id: Opaque identity of the entity that owns the action.
@@ -251,7 +251,7 @@ class BaseAction[W](ABC):
     def on_resume(self, paused_for: int, /) -> None:  # noqa: B027 - optional hook
         """React to resumption after `paused_for` logical ticks.
 
-        Override this hook to shift game-owned deadlines such as `arrives_at`.
+        Override this hook to shift application-owned deadlines such as `arrives_at`.
         The default implementation does nothing.
         """
 
