@@ -1,0 +1,519 @@
+"""Optional Event layer: simultaneous intents resolved as one interaction."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from hashlib import blake2b
+from typing import Literal, NewType, Protocol, cast, final, override, runtime_checkable
+
+from foliot._event_bridge import EventConfigurationError
+from foliot.actions import BaseAction, Bound, Unbound
+from foliot.context import FinalizationContext, TickContext
+from foliot.effects import Effect
+from foliot.ids import EntityId, Tick
+from foliot.rng import Rng, event_resolution_rng
+from foliot.stores import Store, Txn
+
+EventId = NewType("EventId", str)
+"""Stable identity of one persisted Event."""
+
+__all__ = [
+    "BaseEvent",
+    "DecisionContext",
+    "EntityIdTemplate",
+    "EventAction",
+    "EventConfigurationError",
+    "EventId",
+    "EventIdTemplate",
+    "EventStore",
+    "EventTxn",
+    "Events",
+    "IntentRecord",
+    "Outcome",
+    "ResolutionContext",
+    "end_event",
+    "open_event",
+]
+
+_ID_PERSONALIZATION = b"foliot-id-v1"
+
+
+class DecisionContext(Protocol):
+    """Everything one Event participant may read while choosing an Intent."""
+
+    @property
+    def tick(self) -> Tick: ...
+
+    @property
+    def rng(self) -> Rng: ...
+
+
+class ResolutionContext(Protocol):
+    """Everything an Event may read while resolving simultaneous Intents."""
+
+    @property
+    def tick(self) -> Tick: ...
+
+    @property
+    def rng(self) -> Rng: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadContext:
+    tick: Tick
+    rng: Rng
+
+
+@dataclass(frozen=True, slots=True)
+class IntentRecord:
+    """One game Intent with routing metadata attached by foliot."""
+
+    event_id: EventId
+    source_seq: int
+    entity_id: EntityId
+    intent: object
+
+
+class EventAction[W](BaseAction[W], ABC):
+    """One participant's one-shot decision for one Event round."""
+
+    __slots__ = ("_event_id",)
+
+    def __init__(self, entity_id: EntityId, event_id: EventId) -> None:
+        super().__init__(entity_id, suspendable=False)
+        self._event_id = event_id
+
+    @property
+    def event_id(self) -> EventId:
+        return self._event_id
+
+    @final
+    @override
+    def process(self, ctx: TickContext[W], /) -> None:
+        intent = self.decide(_ReadContext(ctx.tick, ctx.rng))
+        if intent is None:
+            raise RuntimeError("an EventAction must return one Intent, not None")
+        _record_intent(
+            ctx,
+            IntentRecord(
+                event_id=self._event_id,
+                source_seq=self.seq,
+                entity_id=self.entity_id,
+                intent=intent,
+            ),
+        )
+
+    @abstractmethod
+    def decide(self, ctx: DecisionContext, /) -> object:
+        """Return exactly one game-defined Intent for the current round."""
+        ...
+
+
+class BaseEvent[W](ABC):
+    """Mandatory base carrying the lifecycle shared by every Event."""
+
+    __slots__ = ("_children", "_event_id")
+
+    def __init__(self, event_id: EventId, children: Iterable[EventAction[W]], /) -> None:
+        children_tuple = tuple(children)
+        _validate_children(event_id, children_tuple)
+        self._event_id = event_id
+        self._children = children_tuple
+
+    @property
+    def event_id(self) -> EventId:
+        return self._event_id
+
+    @property
+    def children(self) -> tuple[EventAction[W], ...]:
+        return self._children
+
+    @abstractmethod
+    def resolve(
+        self,
+        ctx: ResolutionContext,
+        intents: tuple[IntentRecord, ...],
+        /,
+    ) -> Outcome[W]:
+        """Describe the result of one complete simultaneous round."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class _Continue[W]:
+    children: tuple[EventAction[W], ...]
+    due_tick: Tick
+    status: Literal["continue"] = field(default="continue", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _End:
+    status: Literal["end"] = field(default="end", init=False)
+
+
+type _Lifecycle[W] = _Continue[W] | _End
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome[W]:
+    """A pure description returned by one successful Event resolution."""
+
+    effects: tuple[Effect[W], ...]
+    schedules: tuple[tuple[BaseAction[W], Tick | None], ...]
+    deletes: tuple[BaseAction[W], ...]
+    lines: tuple[str, ...]
+    _lifecycle: _Lifecycle[W]
+
+    @staticmethod
+    def continue_with[X](
+        *children: EventAction[X],
+        due_tick: Tick,
+        effects: Iterable[Effect[X]] = (),
+        schedules: Iterable[tuple[BaseAction[X], Tick | None]] = (),
+        deletes: Iterable[BaseAction[X]] = (),
+        log: Iterable[str] = (),
+    ) -> Outcome[X]:
+        """Continue explicitly with fresh children at one shared deadline."""
+        _validate_tick(due_tick, name="due_tick")
+        children_tuple = tuple(children)
+        if not children_tuple:
+            raise ValueError("a continuing Outcome needs at least one next child")
+        _validate_distinct_actions(children_tuple, name="next child")
+        schedules_tuple = tuple(schedules)
+        _validate_schedule_shapes(schedules_tuple)
+        _validate_distinct_schedule_targets(children_tuple, schedules_tuple)
+        return Outcome[X](
+            effects=tuple(effects),
+            schedules=schedules_tuple,
+            deletes=tuple(deletes),
+            lines=_lines(log),
+            _lifecycle=_Continue(children_tuple, due_tick),
+        )
+
+    @staticmethod
+    def end[X](
+        *,
+        effects: Iterable[Effect[X]] = (),
+        schedules: Iterable[tuple[BaseAction[X], Tick | None]] = (),
+        deletes: Iterable[BaseAction[X]] = (),
+        log: Iterable[str] = (),
+    ) -> Outcome[X]:
+        """End explicitly after applying the described work."""
+        schedules_tuple = tuple(schedules)
+        _validate_schedule_shapes(schedules_tuple)
+        _validate_distinct_schedule_targets((), schedules_tuple)
+        return Outcome[X](
+            effects=tuple(effects),
+            schedules=schedules_tuple,
+            deletes=tuple(deletes),
+            lines=_lines(log),
+            _lifecycle=_End(),
+        )
+
+    @property
+    def is_ending(self) -> bool:
+        match self._lifecycle:
+            case _Continue():
+                return False
+            case _End():
+                return True
+
+    @property
+    def next_children(self) -> tuple[EventAction[W], ...]:
+        match self._lifecycle:
+            case _Continue(children=children):
+                return children
+            case _End():
+                return ()
+
+    @property
+    def next_due_tick(self) -> Tick | None:
+        match self._lifecycle:
+            case _Continue(due_tick=due_tick):
+                return due_tick
+            case _End():
+                return None
+
+    @property
+    def scheduled_actions(self) -> tuple[BaseAction[W], ...]:
+        return (*self.next_children, *(action for action, _ in self.schedules))
+
+
+class EventIdTemplate:
+    """Game-declared stable namespace for Events derived from an Action."""
+
+    __slots__ = ("_namespace",)
+
+    def __init__(self, namespace: str, /) -> None:
+        self._namespace = _validate_namespace(namespace)
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    def from_action[W](
+        self,
+        action: BaseAction[W],
+        /,
+        *,
+        tick: Tick,
+        ordinal: int,
+    ) -> EventId:
+        _validate_tick(tick, name="tick")
+        _validate_ordinal(ordinal)
+        value = _stable_id(
+            b"event-from-action",
+            self._namespace.encode("utf-8"),
+            str(action.seq).encode("ascii"),
+            str(tick).encode("ascii"),
+            str(ordinal).encode("ascii"),
+        )
+        return EventId(f"event-v1:{value}")
+
+
+class EntityIdTemplate:
+    """Game-declared stable namespace for entities owned by an Event."""
+
+    __slots__ = ("_namespace",)
+
+    def __init__(self, namespace: str, /) -> None:
+        self._namespace = _validate_namespace(namespace)
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    def from_event(self, event_id: EventId, /, *, ordinal: int) -> EntityId:
+        _validate_ordinal(ordinal)
+        value = _stable_id(
+            b"entity-from-event",
+            self._namespace.encode("utf-8"),
+            str(event_id).encode("utf-8"),
+            str(ordinal).encode("ascii"),
+        )
+        return EntityId(f"entity-v1:{value}")
+
+
+class EventStore[W](Store[W], Protocol):
+    """The optional read capability added by an Event-enabled store."""
+
+    def event(self, event_id: EventId, /) -> BaseEvent[W] | None: ...
+
+
+@runtime_checkable
+class EventTxn[W](Txn[W], Protocol):
+    """Event writes implemented by the same physical tick transaction."""
+
+    def event_open(self, event: BaseEvent[W], due_tick: Tick, /) -> None: ...
+
+    def event_continue(
+        self,
+        event: BaseEvent[W],
+        children: tuple[EventAction[W], ...],
+        due_tick: Tick,
+        /,
+    ) -> None: ...
+
+    def event_end(self, event_id: EventId, /) -> None: ...
+
+
+class Events[W]:
+    """The explicit optional collaborator connected to one `Simulation`."""
+
+    __slots__ = ("_store",)
+
+    def __init__(self, store: EventStore[W], /) -> None:
+        self._store = store
+
+    @property
+    def store(self) -> EventStore[W]:
+        return self._store
+
+    def event(self, event_id: EventId, /) -> BaseEvent[W] | None:
+        return self._store.event(event_id)
+
+    def resolution_context(
+        self,
+        world_seed: int,
+        event_id: EventId,
+        tick: Tick,
+        /,
+    ) -> ResolutionContext:
+        return _ReadContext(tick, event_resolution_rng(world_seed, str(event_id), tick))
+
+    def validate_open(self, event: BaseEvent[W], due_tick: Tick, tick: Tick, /) -> None:
+        if due_tick <= tick:
+            raise ValueError("an Event's due_tick must be later than the current tick")
+        if self.event(event.event_id) is not None:
+            raise ValueError(f"Event id already exists: {event.event_id}")
+        for child in event.children:
+            match child.binding:
+                case Unbound():
+                    pass
+                case Bound():
+                    raise RuntimeError("an Event must open with unbound child actions")
+
+    def validate_outcome(
+        self,
+        event: BaseEvent[W],
+        outcome: Outcome[W],
+        tick: Tick,
+        /,
+    ) -> None:
+        for _, due_tick in outcome.schedules:
+            if due_tick is not None and due_tick <= tick:
+                raise ValueError("an Outcome schedule must target a future tick")
+        if outcome.is_ending:
+            return
+        due_tick = outcome.next_due_tick
+        if due_tick is None or due_tick <= tick:
+            raise ValueError("a continuing Outcome must target a future tick")
+        _validate_children(event.event_id, outcome.next_children)
+        for child in outcome.next_children:
+            match child.binding:
+                case Unbound():
+                    pass
+                case Bound():
+                    raise RuntimeError("a continuing Outcome needs fresh unbound children")
+
+    def uses_store(self, store: object, /) -> bool:
+        """Whether this collaborator is attached to the supplied core store."""
+        return self._store is store
+
+    def open(self, txn: Txn[W], event: BaseEvent[W], due_tick: Tick, /) -> None:
+        _event_txn(txn).event_open(event, due_tick)
+
+    def continue_event(
+        self,
+        txn: Txn[W],
+        event: BaseEvent[W],
+        outcome: Outcome[W],
+        /,
+    ) -> None:
+        due_tick = outcome.next_due_tick
+        if due_tick is None:
+            raise RuntimeError("an ending Outcome cannot continue an Event")
+        _event_txn(txn).event_continue(event, outcome.next_children, due_tick)
+
+    def end(self, txn: Txn[W], event_id: EventId, /) -> None:
+        _event_txn(txn).event_end(event_id)
+
+
+def open_event[W](ctx: TickContext[W], event: BaseEvent[W], due_tick: Tick, /) -> None:
+    """Ask the configured Event layer to open an Event after this action."""
+    sink = getattr(ctx, "_foliot_open_event", None)
+    if not callable(sink):
+        raise EventConfigurationError(
+            "open_event() needs Simulation(..., events=Events(event_store))"
+        )
+    callback = cast(Callable[[BaseEvent[W], Tick], None], sink)
+    callback(event, due_tick)
+
+
+def end_event[W](ctx: FinalizationContext[W], event_id: EventId, /) -> None:
+    """Explicitly close an Event from post-effect game finalization."""
+    sink = getattr(ctx, "_foliot_end_event", None)
+    if not callable(sink):
+        raise EventConfigurationError(
+            "end_event() needs Simulation(..., events=Events(event_store))"
+        )
+    callback = cast(Callable[[EventId], None], sink)
+    callback(event_id)
+
+
+def _record_intent[W](ctx: TickContext[W], record: IntentRecord, /) -> None:
+    """Internal bridge used by the final `EventAction.process` implementation."""
+    sink = getattr(ctx, "_foliot_record_intent", None)
+    if not callable(sink):
+        raise EventConfigurationError(
+            "EventAction needs Simulation(..., events=Events(event_store))"
+        )
+    callback = cast(Callable[[IntentRecord], None], sink)
+    callback(record)
+
+
+def replace_event_children[W](event: BaseEvent[W], children: tuple[EventAction[W], ...], /) -> None:
+    """Publish a committed child replacement in the in-memory adapter."""
+    _validate_children(event.event_id, children)
+    event._children = children  # pyright: ignore[reportPrivateUsage] -- same-module lifecycle
+
+
+def _event_txn[W](txn: Txn[W]) -> EventTxn[W]:
+    if not isinstance(txn, EventTxn):
+        raise EventConfigurationError(
+            "the tick transaction does not implement the EventTxn capability"
+        )
+    return txn
+
+
+def _validate_children[W](
+    event_id: EventId,
+    children: tuple[EventAction[W], ...],
+) -> None:
+    if not children:
+        raise ValueError("an Event needs at least one child EventAction")
+    _validate_distinct_actions(children, name="Event child")
+    for child in children:
+        if child.event_id != event_id:
+            raise ValueError("every child EventAction must carry its Event's id")
+
+
+def _validate_distinct_actions[W](actions: tuple[BaseAction[W], ...], *, name: str) -> None:
+    seen: set[int] = set()
+    for action in actions:
+        action_key = id(action)
+        if action_key in seen:
+            raise ValueError(f"the same {name} object cannot appear twice")
+        seen.add(action_key)
+
+
+def _validate_distinct_schedule_targets[W](
+    children: tuple[EventAction[W], ...],
+    schedules: tuple[tuple[BaseAction[W], Tick | None], ...],
+) -> None:
+    actions: tuple[BaseAction[W], ...] = (*children, *(action for action, _ in schedules))
+    _validate_distinct_actions(actions, name="scheduled action")
+
+
+def _validate_schedule_shapes[W](
+    schedules: tuple[tuple[BaseAction[W], Tick | None], ...],
+) -> None:
+    for _, due_tick in schedules:
+        if due_tick is not None:
+            _validate_tick(due_tick, name="scheduled due_tick")
+
+
+def _lines(lines: Iterable[str]) -> tuple[str, ...]:
+    return tuple(lines)
+
+
+def _validate_namespace(namespace: object) -> str:
+    if not isinstance(namespace, str):
+        raise TypeError("namespace must be a str")
+    if not namespace:
+        raise ValueError("namespace must not be empty")
+    return namespace
+
+
+def _validate_tick(tick: object, *, name: str) -> None:
+    if isinstance(tick, bool) or not isinstance(tick, int):
+        raise TypeError(f"{name} must be an int, not bool")
+    if tick < 0:
+        raise ValueError(f"{name} must be non-negative")
+
+
+def _validate_ordinal(ordinal: object) -> None:
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+        raise TypeError("ordinal must be an int, not bool")
+    if ordinal < 0:
+        raise ValueError("ordinal must be non-negative")
+
+
+def _stable_id(kind: bytes, *parts: bytes) -> str:
+    digest = blake2b(digest_size=16, person=_ID_PERSONALIZATION)
+    for part in (kind, *parts):
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()

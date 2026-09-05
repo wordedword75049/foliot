@@ -23,6 +23,7 @@ _SPLITMIX_INCREMENT = 0x9E3779B97F4A7C15
 _SPLITMIX_MULTIPLIER_1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_MULTIPLIER_2 = 0x94D049BB133111EB
 _PERSONALIZATION = b"foliot-rng-v1"
+_EVENT_PERSONALIZATION = b"foliot-event-v1"
 
 
 class Rng(Protocol):
@@ -66,6 +67,27 @@ def counter_rng(
     _validate_world_seed(world_seed)
     stream_seed = _stream_seed(world_seed, entity_id, tick, seq)
     return _CounterRng(stream_seed)
+
+
+def event_resolution_rng(world_seed: int, event_id: str, tick: Tick, /) -> Rng:
+    """Create one internal stream for shared Event resolution.
+
+    This is intentionally not re-exported. Games receive the resulting stream
+    through `ResolutionContext`; they never construct or seed it themselves.
+    Its separate BLAKE2 personalization makes collision with an action stream
+    impossible even if a game chooses matching textual identities.
+    """
+    _validate_world_seed(world_seed)
+    digest = blake2b(
+        digest_size=8,
+        key=world_seed.to_bytes(16, "big"),
+        person=_EVENT_PERSONALIZATION,
+    )
+    parts = (event_id.encode("utf-8"), str(tick).encode("ascii"))
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return _CounterRng(int.from_bytes(digest.digest(), "big"))
 
 
 class _CounterRng:

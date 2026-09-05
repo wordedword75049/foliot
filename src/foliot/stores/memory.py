@@ -40,6 +40,11 @@ class _Delete[W]:
 
 
 @dataclass(frozen=True, slots=True)
+class _DeleteOwnedBy:
+    entity_id: EntityId
+
+
+@dataclass(frozen=True, slots=True)
 class _Suspend:
     entity_id: EntityId
     by: SuspensionId
@@ -56,7 +61,7 @@ class _Log:
     line: str
 
 
-type _Command[W] = _Schedule[W] | _Delete[W] | _Suspend | _Resume | _Log
+type _Command[W] = _Schedule[W] | _Delete[W] | _DeleteOwnedBy | _Suspend | _Resume | _Log
 
 
 @dataclass(slots=True)
@@ -155,6 +160,7 @@ class _MemoryTxn[W]:
         "_commands",
         "_known_actions",
         "_next_seq",
+        "_scheduled_action_keys",
         "_state",
         "_tick",
         "_touched_actions",
@@ -166,6 +172,7 @@ class _MemoryTxn[W]:
         self._next_seq = state.next_seq
         self._commands: list[_Command[W]] = []
         self._known_actions = {id(action) for action in state.actions.values()}
+        self._scheduled_action_keys: set[int] = set()
         self._touched_actions: dict[int, BaseAction[W]] = {}
         self._closed = False
 
@@ -198,6 +205,9 @@ class _MemoryTxn[W]:
                 raise ValueError("due_tick must be later than the transaction tick")
 
         action_key = id(action)
+        if action_key in self._scheduled_action_keys:
+            raise RuntimeError("the same action object cannot be scheduled twice in one tick")
+        self._scheduled_action_keys.add(action_key)
         new_seq: int | None = None
         if action_key not in self._known_actions:
             match action.binding:
@@ -218,6 +228,10 @@ class _MemoryTxn[W]:
             raise RuntimeError("the action does not belong to this store")
         self._touched_actions[action_key] = action
         self._commands.append(_Delete(action))
+
+    def delete_owned_by(self, entity_id: EntityId, /) -> None:
+        self._ensure_open()
+        self._commands.append(_DeleteOwnedBy(entity_id))
 
     def suspend(self, entity_id: EntityId, by: SuspensionId, /) -> None:
         self._ensure_open()
@@ -303,18 +317,24 @@ def _commit[W](state: _MemoryState[W], txn: _MemoryTxn[W]) -> None:
     tick_before = state.current_tick
 
     try:
+        owners_to_delete: set[EntityId] = set()
         for command in txn.commands:
             match command:
                 case _Schedule(action=action, due_tick=due_tick, new_seq=new_seq):
                     _apply_schedule(state, action, due_tick, new_seq)
                 case _Delete(action=action):
                     _apply_delete(state, action)
+                case _DeleteOwnedBy(entity_id=entity_id):
+                    owners_to_delete.add(entity_id)
                 case _Suspend(entity_id=entity_id, by=by):
                     _apply_suspend(state, entity_id, by, txn.tick)
                 case _Resume(by=by):
                     _apply_resume(state, by, txn.tick)
                 case _Log(tick=tick, line=line):
                     state.logs.append((tick, line))
+
+        for entity_id in owners_to_delete:
+            _apply_delete_owned_by(state, entity_id)
 
         state.next_seq = txn.next_seq
         state.current_tick = txn.tick + 1
@@ -373,6 +393,12 @@ def _apply_delete[W](state: _MemoryState[W], action: BaseAction[W]) -> None:
                 case Suspended():
                     pass
             del state.actions[seq]
+
+
+def _apply_delete_owned_by[W](state: _MemoryState[W], entity_id: EntityId) -> None:
+    for action in tuple(state.actions.values()):
+        if action.entity_id == entity_id:
+            _apply_delete(state, action)
 
 
 def _apply_suspend[W](

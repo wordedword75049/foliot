@@ -212,7 +212,7 @@ on unrelated simulations.
 | Counter-based RNG on `(world_seed, entity_id, tick, seq)` | `GameAction.target_id`, target lookup, and what acting against a target means |
 | `Store` protocol + in-memory implementation | narrative log text |
 | The tick-transaction boundary | the `encode`/`decode` pair, and the database |
-| Layer 2 (optional): intents, event grouping, resolvers | what a resolver decides |
+| Layer 2 (optional): event-bound intents and resolvers | what a resolver decides |
 
 **Notable exclusion — `target_id`; directed game actions remain easy.** The
 game's ontology says every action is directed, but that is not true of every
@@ -1142,6 +1142,27 @@ and forces rollback; only handler exceptions can be isolated and skipped,
 because handlers run before writes and their private contexts can be discarded
 whole (§7.4).
 
+An optional game-supplied `TickFinalizer` runs after every valid ordinary-Action
+and Event Outcome effect has been applied and before the tick commits. It sees
+the post-effect world and a narrow collecting `FinalizationContext`; it does
+not receive the raw `Txn`.
+This is the place for game lifecycle rules such as recognizing zero HP,
+emitting a game-defined `MarkDead` effect, deleting the dead entity's owned
+actions, and writing a story line. Foliot owns when this boundary runs and
+keeps its commands in the tick transaction; it knows nothing about HP, death,
+characters, or any other domain noun. A finalizer exception is tick-fatal and
+rolls back the transaction just like an effect exception.
+
+When Layer 2 is enabled, Event persistence participates in this same boundary.
+The optional `foliot.events` module defines structural `EventStore` and
+`EventTxn` extensions of the ordinary `Store` and `Txn` capabilities. One
+concrete adapter and one concrete transaction object implement both views, so
+opening or advancing an Event, persisting its ephemeral payload, suspending an
+activity, scheduling its child actions, applying game effects, logging, and
+advancing the clock commit together or not at all. A separate Event database
+transaction would permit half-open fights after a crash and is not supported.
+Consumers that do not enable Layer 2 implement only the ordinary protocols.
+
 At 1 tick/second that is 86,400 transactions a day, which is nothing for
 Postgres. Under `ManualDriver`, the in-memory store performs no I/O but its
 transaction is not a no-op: it stages foliot-owned queue changes, bindings,
@@ -1183,6 +1204,7 @@ class Txn[W](Protocol):  # the tray: writing, valid only inside a tick
 
     def schedule(self, action: BaseAction[W], due_tick: Tick | None) -> None: ...
     def delete(self, action: BaseAction[W]) -> None: ...
+    def delete_owned_by(self, entity_id: EntityId) -> None: ...
     def suspend(self, entity_id: EntityId, by: SuspensionId) -> None: ...
     def resume(self, by: SuspensionId) -> None: ...
     def log(self, tick: Tick, line: str) -> None: ...
@@ -1226,6 +1248,15 @@ changes travel as `Effect` objects the engine only knows how to `apply`
 (§7.4, §10.4). A `txn.damage(...)` method would put the game inside the
 library, which is §3's line.
 
+`delete_owned_by(entity_id)` is still an engine-shaped queue operation, not a
+game verb. It atomically removes every action whose core owner is that entity,
+including active actions, suspended actions, and actions scheduled earlier in
+the same transaction. A SQL adapter can implement it as one set-based delete;
+`MemoryStore` removes matching staged and existing entries. It deliberately
+does **not** inspect game payload such as `target_id`, so actions owned by other
+entities but targeting the removed entity are not silently cascaded. The game
+or an explicit Event owns that cleanup decision.
+
 **The clock advance is implicit, and that is deliberate.** There is no
 `advance_to`. `tick_transaction(5)` already knows it is tick 5, so a
 clean exit records tick 5 as finished and `current_tick()` then returns
@@ -1266,6 +1297,18 @@ Caching is the store's business too. The near-horizon window — pull the
 next few minutes into memory rather than querying every tick — is an
 optimisation a consumer's Postgres store may make internally. The engine just asks
 `due(tick)` and does not care whether that hit RAM or disk.
+
+Layer 2 does not enlarge these core protocols. Its `EventStore` / `EventTxn`
+protocols structurally add the Event operations needed by the optional
+collaborator while retaining every ordinary operation above. A production game
+implements the combined capabilities on its same database adapter and tick
+transaction; it does not coordinate two commits. For dependency-free Layer-2
+tests and examples, `foliot.events` supplies an event-capable in-memory
+implementation built around `MemoryStore`, while normal `MemoryStore` remains
+unaware of Events. The implemented extension points are
+`EventStore.event(event_id)` and the same-transaction
+`EventTxn.event_open(...)`, `event_continue(...)`, and `event_end(...)`
+operations.
 
 ### 8.6 The shape, end to end
 
@@ -1379,6 +1422,15 @@ rng.below(n)   # uniform integer in [0, n)
 There is no `chance(probability)` convenience method. The game owns the
 probability formula and writes `rng.random() < probability` itself; foliot
 would add vocabulary but no guarantee by wrapping that one comparison.
+
+Layer 2 adds one other counter-based stream shape for shared Event resolution.
+Participant choices still use their ordinary action streams. A resolver that
+needs randomness receives an Event-owned stream derived from
+`(world_seed, event_id, tick)` with an explicit event-resolution domain tag,
+so it belongs to neither participant and cannot collide with an action stream.
+The Event resolves at most one round per tick, so no additional round cursor is
+needed. Its persisted deterministic `event_id` and the tick identify the
+resolution attempt completely.
 
 `below(n)` accepts exactly `1 <= n <= 2**64`. Supporting larger Python
 integers would require joining multiple 64-bit draws for no realistic queue or
@@ -1545,13 +1597,32 @@ without layer 2**.
 - **Layer 1** — clock, queue, drivers, RNG, store, actions. A handler is
   `process(ctx) -> None`, telling a collecting context about schedules,
   effects, log lines, and completion. No
-  intents, no grouping. This alone runs walking, poison, cooldowns,
+  intents, no events. This alone runs walking, poison, cooldowns,
   travel — most of a world.
-- **Layer 2** — intents, event grouping, resolvers. A separate importable
-  module, added after layer 1 is real.
+- **Layer 2** — EventActions, event-bound intents, and resolvers. A separate
+  importable module, added after layer 1 is real and connected to the one
+  `Simulation` only when the consumer explicitly supplies it.
 
 If layer 1 cannot be used without layer 2, we have built a framework with
-a mandatory opinion. If it can, we have built a library.
+a mandatory opinion. If it can, we have built a library. There is no second
+`EventSimulation` and no generic module/plugin framework. Conceptually, the
+two supported constructions are:
+
+```python
+simulation = Simulation(store)                 # no event work exists
+simulation = Simulation(store, events=events)  # explicit Layer-2 opt-in
+```
+
+Without the collaborator, `Simulation` does not attempt event registration or
+resolution and does not import a concrete event implementation. The drivers
+still know only when a tick runs; they know nothing about Events in either
+configuration. Supplying the collaborator adds the EventAction path and its
+resolution phase, but ordinary actions still collect and apply effects,
+schedules, deletions, and logs exactly as they do without Layer 2. An
+incomplete Event discards only that Event's attempt; unrelated ordinary work
+still commits. The concrete opt-in is `Events(store)`, and `Simulation`
+requires that collaborator and its ordinary store to be the same object so
+there cannot be two independent commits.
 
 **Why layer 2 is in at all**, by the §2 test: it adds a guarantee the
 consumer cannot bolt on — **simultaneity.** N participants each decide
@@ -1562,37 +1633,414 @@ tick, which is the engine's job.
 The pipeline it provides:
 
 ```
-queue.due(tick)                -> [Action]
-  for each action: decide()    -> [Intent]     (reads frozen state)
-  group intents by event_key   -> [Event]
-  for each event: resolve()    -> Outcome      (the only writer)
-  apply effects, enqueue schedules, delete cancels
+queue.due(tick)                         -> [Action]
+  process every action in one loop
+    ordinary action                     -> effects / schedules / log
+    EventAction(event_id)                -> Intent(event_id)
+  register intents with their Events
+  resolve every ready Event             -> Outcome
+  begin one transaction
+    apply all action and Event commands
+    optional TickFinalizer sees post-effect world -> final commands
+    apply final commands
+  commit
 ```
 
-The decide phase never mutates. The resolve phase never reads anything it
-was not handed. That split is what makes ticks order-independent.
+`EventAction`s are not processed in a separate pass. They are ordinary queued
+actions carrying an `event_id`; their distinguishing behaviour is producing an
+intent instead of an immediate world effect. The extra phase starts only after
+all due actions have been processed. There is no inferred generic "group": an
+intent registers with the explicit persisted Event whose ID it carries.
 
-**A resolver must re-validate its participants** at resolution time.
-Between decide and resolve, a participant may have died in a different
-event during the same tick. Degrade gracefully; never assume both parties
-still exist.
+**One Event attempt is all-or-nothing — DECIDED.** If an Event expects Lira
+and the wolf this tick but either EventAction fails or does not supply its
+intent, that Event does not resolve. None of that Event's current-tick intents
+or action contexts is applied or retained, and every participant EventAction
+remains in the queue. On the next tick, the store returns those still-overdue
+actions again (`due_tick <= tick`), so all participants decide again from fresh
+contexts and produce fresh intents against one new shared tick snapshot. The
+persisted Event remains open, but it does not accumulate partial decisions
+from different ticks. No copied action, duplicate queue entry, recurring flag,
+or separate "retry Event" job is needed.
+
+**The Event's child EventActions define the expected set — DECIDED.** On a
+fight response, an EventfulEnvironment creates both the ephemeral opponent and
+the Event, together with the exact EventAction for each party. Those children
+are scheduled as part of opening the Event and, once admitted, their permanent
+action identities tell the Event which intents must arrive. Readiness is
+therefore not a second independently maintained list of entity IDs. An Intent
+still records the exact source action that produced it; `entity_id` says who
+acted, while the source action identity says which expected child has
+answered. The semantic source of truth is settled: the Event's own child
+actions. A newly admitted child is connected to its Event through
+`BaseEvent.children`: the in-memory Event transaction
+replaces that exact tuple only when the surrounding tick transaction commits.
+
+**The Event persists; a resolved round's EventActions do not — DECIDED.** Each
+child EventAction represents one participant's opportunity to choose an Intent
+for one round. It may inspect current state and choose attack, dodge-and-heal,
+escape, or any other game-defined Intent; the queued action need not have that
+choice baked into its class name before it runs. When a complete round
+resolves and the Event continues, its current children are consumed and the
+Outcome schedules a fresh child EventAction for each party on a future tick.
+Those new objects receive new permanent `seq` values and become the Event's
+new expected set. They therefore decide from the world produced by the prior
+round. Deterministic creation and scheduling order keeps their new identities
+replayable.
+
+**Continuing or ending is explicit in the Outcome — DECIDED.** A resolver does
+not communicate Event lifecycle indirectly through whether a list happens to
+be empty. It deliberately returns one of these forms:
+
+```python
+return Outcome.continue_with(
+    lira_turn,
+    wolf_turn,
+    due_tick=ctx.tick + 1,
+    effects=[...],
+    log=[...],
+)
+```
+
+or:
+
+```python
+return Outcome.end(effects=[...], log=[...])
+```
+
+For example, a wolf choosing and successfully resolving an escape produces an
+explicit ending Outcome. Continuing consumes the current children and admits
+the supplied fresh children for a future round; ending removes the Event after
+its Outcome is applied. This prevents a forgotten next-round action from
+silently masquerading as an intentional end. The exact fields beyond this
+lifecycle distinction remain ordinary Outcome interface work.
+
+**The next round's shared deadline is explicit — DECIDED.**
+`Outcome.continue_with(...)` requires one `due_tick`, and every fresh child is
+admitted at that same tick. It must be strictly later than the resolving tick,
+under the normal scheduling rule. Foliot does not hardcode `tick + 1`: a game
+may choose the next tick or leave five ticks between rounds without introducing
+another timing mechanism.
+
+**Closing releases that Event's suspensions automatically — DECIDED.** After a
+successful `Outcome.end(...)` is applied, foliot resumes every action whose
+`suspended_by` equals the closing Event's id, using the normal pause-shifting
+rule, and removes the Event in the same transaction. The Event's current child
+actions and every Event-owned ephemeral payload object, such as its wolf,
+disappear with it. This mirrors a finished Action: live working state ceases to
+exist while committed effects and journal history remain. A game that wants an
+ephemeral entity to persist must explicitly create permanent game state before
+ending. Closing cannot wake work held by another Event, and a non-interrupting
+Event simply finds nothing to resume. Opening remains deliberately different:
+it never suspends anything unless the game explicitly requests that policy. If
+later finalization removes a dead entity's actions in the same transaction,
+those deletions leave no resumed work behind. Any failure still rolls the
+whole tick back, including cleanup and wake-up.
+
+This does not contradict retrying an incomplete attempt. If one child fails or
+is missing, the round did not resolve, so the same current children remain
+pending and all retry next tick. Fresh children are created only after a round
+successfully resolves. Poison and other continuing conditions are different:
+they reschedule the same object because they are one ongoing condition, not a
+new decision in a new combat round.
+
+**EventActions decide one intent through a narrow context — DECIDED.** An
+ordinary game action continues to implement `process(TickContext) -> None`.
+The library's `EventAction` supplies that required processing bridge, while a
+game subclass implements `decide(DecisionContext) -> Intent` for its one round:
+
+```python
+class DecisionContext(Protocol):
+    @property
+    def tick(self) -> Tick: ...
+
+    @property
+    def rng(self) -> Rng: ...
+```
+
+That is the entire public context. It has no `emit`, `schedule`, `finish`,
+`log`, world, store, or Event registry. The participant chooses; only the
+resolver produces effects, schedules, deletions, and narrative about what
+actually happened. As with ordinary actions, required game objects are
+explicit fields on the game action rather than services fetched through its
+context. The `rng` is the usual stream already bound to the EventAction's
+`(world_seed, entity_id, tick, seq)`.
+
+The game returns exactly one game-defined Intent value. Foliot wraps it with
+the EventAction's `event_id` and permanent source `seq`, so game code cannot
+forget the routing and identity metadata. Raising or failing to return an
+Intent makes that Event attempt incomplete under the all-or-nothing rule
+above. The internal context implementation remains private, just as Layer 1's
+collecting `_Context` does.
+
+**Shared resolution uses an Event-owned RNG — DECIDED.** The resolver receives
+another narrow context:
+
+```python
+class ResolutionContext(Protocol):
+    @property
+    def tick(self) -> Tick: ...
+
+    @property
+    def rng(self) -> Rng: ...
+```
+
+Its `rng` is counter-based and domain-separated from action streams, using the
+conceptual identity `(world_seed, event_id, tick, "event-resolution")`.
+Participant action RNGs decide what Lira and the wolf attempt; this Event RNG
+settles uncertainty shared between those attempts, such as whether an attack
+beats a dodge. Using either participant's stream would make a shared result
+arbitrarily belong to one side, while a global stream would recreate the
+cross-event coupling rejected in §9.2.
+
+Foliot supplies only the deterministic draw. Hit chance remains game logic:
+the resolver or a game-owned combat service may calculate it from the hitter's
+agility and the dodger's speed, agility, current HP, or any other game state,
+then explicitly compare `ctx.rng.random() < hit_chance`. There is still no
+library `chance()` helper and no combat formula in foliot.
+
+**The Event owns its resolution behaviour — DECIDED.** Each game-defined Event
+implements `resolve(ctx, intents) -> Outcome`, just as each game-defined Action
+owns its behaviour. Foliot calls that method directly; there is no resolver
+registry, Event-kind lookup, or separate mandatory resolver object. An Event
+may delegate substantial game rules to an explicit service field:
+
+```python
+def resolve(self, ctx, intents):
+    return self.combat_rules.resolve_round(ctx, self, intents)
+```
+
+That delegation is ordinary game composition, not foliot registration. The
+store reconstructs the concrete Event subclass in the same sense that it
+reconstructs concrete Action subclasses (§7.3); persistence does not require
+moving behaviour into a kind registry.
+
+**`BaseEvent` is mandatory — DECIDED.** Events follow the same architectural
+pattern as Actions: foliot supplies one universal base for the invariants every
+Event must share, and the game subclasses it with its own payload and
+behaviour. Conceptually:
+
+```python
+class BaseEvent(ABC):
+    @property
+    def event_id(self) -> EventId: ...
+
+    @property
+    def children(self) -> tuple[EventAction, ...]: ...
+
+    @abstractmethod
+    def resolve(self, ctx: ResolutionContext, intents: tuple[IntentRecord, ...]) -> Outcome: ...
+```
+
+Foliot owns the stable Event id, the exact current child EventActions, replacing
+that child set after a resolved continuing round, and removing the Event when
+it closes. A game-owned `FightEvent(BaseEvent)` keeps the wolf, round data,
+combat-rules service, and concrete `resolve(...)` implementation on that same
+object; no wrapper may discard those subclass fields.
+
+The pattern does not mean copying Action mechanics that do not apply. An Event
+is persisted but is not itself in the action queue, so `BaseEvent` has no
+`due_tick`, `suspendable`, or `ActionState`. Existence in Event persistence
+means open; closing removes it. There is no open/closed enum or tombstone. The
+store owns serialization and reconstruction of concrete Event subclasses just
+as it does for Actions.
+
+**An Event has its final deterministic id at construction — DECIDED.** The id
+must already exist before persistence because the environment needs it to
+derive ephemeral entity ids, put `event_id` on every child EventAction, and use
+it as an explicit suspension handle. The store neither allocates nor replaces
+it; opening rejects a duplicate. Children remain ordinary unbound actions and
+receive their permanent `seq` values only when the same transaction schedules
+them.
+
+The illustrative strings `"fight:{seq}:{tick}:0"` and `"...:wolf:0"` are
+**not** the public encoding. The accepted API uses two reusable typed templates
+declared once as game constants:
+
+```python
+FIGHT_EVENTS = EventIdTemplate("zpg.fight")
+FIGHT_WOLVES = EntityIdTemplate("zpg.fight.wolf")
+
+event_id = FIGHT_EVENTS.from_action(source_action, tick=tick, ordinal=0)
+wolf_id = FIGHT_WOLVES.from_event(event_id, ordinal=0)
+```
+
+The namespace strings are stable game schema identifiers, not display names
+or pieces manually concatenated at each call site. Foliot never derives them
+from a Python class or module name, because an innocent refactor would then
+change future ids. `EventIdTemplate.from_action(...)` combines its namespace,
+the source action's permanent `seq`, the tick, and an explicit ordinal;
+`EntityIdTemplate.from_event(...)` combines its namespace, the parent Event id,
+and an explicit ordinal. The distinct template types prevent mixing the two
+derivation directions.
+
+Both return opaque `EventId` / `EntityId` strings produced by a documented,
+versioned stable digest with length-framed inputs—never Python's salted
+`hash()`. The chosen byte layout and digest output become replay compatibility
+promises and receive golden vectors, just like the RNG (§9.4). Renaming a
+template namespace is therefore a deliberate data migration, not a cosmetic
+code refactor.
+
+**Opening admits the Event and all initial children together — DECIDED.** The
+game makes one Layer-2 request:
+
+```python
+from foliot.events import open_event
+
+open_event(ctx, event, due_tick=ctx.tick + 1)
+ctx.suspend(lira.entity_id, by=event.event_id)  # explicit game policy
+```
+
+`open_event(...)` persists the BaseEvent and its event-owned payload, admits
+every action already declared in `event.children`, schedules all of them for
+the one supplied future tick, and records those exact newly bound children as
+the Event's expected set. The shared deadline is structural: initial
+participants must decide against the same tick snapshot. The request rejects a
+non-future deadline under the existing scheduling rule, and Event persistence
+rejects a duplicate Event id as already decided. Further defensive child-set
+validation is an implementation detail and must not broaden the public model.
+
+The game does not separately call `schedule(...)` for each child or maintain a
+second expected-participant list. That would allow a half-described Event even
+inside an atomic transaction—for example, forgetting the wolf's turn while
+still opening the fight. Admission and child binding still land in the same
+physical tick transaction as every other command (§8.3). Suspension is not
+part of `open_event`: the second line is an independent explicit request and a
+non-interrupting Event omits it.
+
+**Event opening is isolated behind an explicit import — DECIDED.** The public
+`TickContext` stays exactly the ordinary Layer-1 interface; it does not grow an
+`open_event()` method that would appear in games which never use Events. An
+Event-producing action explicitly imports the free function from
+`foliot.events` and passes its normal context to it. The function hands the
+request to the optional Event collaborator attached to that `Simulation`.
+Calling it when Event support was not configured fails with a clear
+configuration error. There is no second `EventContext`, required
+`EventProducerAction` base, or alternate `process()` signature.
+
+"Current" means the frozen state at the start of that tick. If Lira begins a
+round at 6 HP while Poison also contributes `-2` during the same tick, the
+hit-versus-dodge formula sees 6 HP whether Poison's action happened to be
+iterated before or after the EventActions. Poison and the round's effects apply
+only after decisions and resolution; their resulting state affects the next
+round. Letting the resolver observe already-applied same-tick effects would
+make action order significant and would quietly introduce the effect-priority
+mechanism that remains deliberately deferred.
+
+**Resolver failures are isolated to their Event — DECIDED.** A resolver is
+still pure decision code: it returns an Outcome and performs no writes. If it
+raises, or produces an invalid Outcome, foliot reports one operational `ERROR`
+with the tick, Event id, resolver identity, and traceback; discards that
+Event's entire current attempt; keeps its Event and exact current child
+EventActions pending; and lets unrelated ordinary actions and ready Events
+continue. The failed Event's participants decide again from fresh contexts on
+the next tick. No partial Outcome or deterministic story line survives.
+
+This isolation ends at the apply boundary. If the resolver returned a valid
+Outcome but one of its Effects raises while applying, mutation has begun and
+the existing Layer-1 rule applies: the exception escapes and the whole tick
+rolls back (§8.3). Thus a broken fight decision does not freeze the shared
+world, while a partially written tick is never committed.
+
+The action phase never mutates. Event resolution therefore sees the same
+tick-start world that every action saw. The resolution phase never reads
+anything it was not handed. That split is what makes ticks order-independent.
+Every valid effect produced during the tick still applies: an attack is not
+cancelled merely because hunger or poison also produces lethal damage against
+its source during that tick. Effect priority is recorded as a possible later
+game mechanism, but is not accepted as part of M8.
+
+**Death uses final tick state and optional finalization — DECIDED.** Death is
+not recognized merely because an intermediate effect crosses zero. If Lira
+starts with 1 HP and the same tick supplies poison `-2` and healing `+5`, every
+effect goes through and she finishes alive at 4 HP. The game evaluates death
+only from the combined post-effect state. Effect priority remains a recorded
+possibility, not an accepted mechanism.
+
+Foliot supplies one small, optional Layer-1 lifecycle seam because an ordinary
+action such as Poison or Hunger can create the need for finalization even when
+Layer 2 is not installed:
+
+```python
+class TickFinalizer[W](Protocol):
+    def finalize(self, world: W, ctx: FinalizationContext[W]) -> None: ...
+
+
+class FinalizationContext[W](Protocol):
+    @property
+    def tick(self) -> Tick: ...
+
+    def emit(self, effect: Effect[W]) -> None: ...
+    def schedule(self, action: BaseAction[W], due_tick: Tick | None) -> None: ...
+    def delete(self, action: BaseAction[W]) -> None: ...
+    def delete_owned_by(self, entity_id: EntityId) -> None: ...
+    def log(self, line: str) -> None: ...
+```
+
+The game optionally supplies it as `Simulation(store, finalizer=...)`; a pure
+Layer-1 simulation that needs no lifecycle finalization omits it. The engine
+calls it once after normal effects have produced the post-effect world and
+before commit, then applies its collected effects and queue/log commands in
+the same transaction. The game can therefore recognize death, emit its own
+`MarkDead` effect, remove every action owned by that entity with
+`delete_owned_by`, and log the result. The context is deliberately narrow:
+game code does not receive the raw `Txn`, and foliot never learns what HP or
+death means. If finalization raises, the whole tick fails and rolls back.
+
+When Layer 2 is enabled, a finalizer may explicitly end an Event through the
+separately imported helper rather than adding Event methods to the ordinary
+context:
+
+```python
+from foliot.events import end_event
+
+
+def finalize(self, world, ctx):
+    if world.lira.hp <= 0:
+        ctx.delete_owned_by(world.lira.entity_id)
+        end_event(ctx, world.lira.fight_event_id)
+        ctx.log("Lira died.")
+```
+
+`end_event(ctx, event_id)` follows the same atomic cleanup path as
+`Outcome.end(...)`: it removes the Event, its ephemeral payload, and its
+current or already-staged next-round children, then resumes actions held by
+that Event id. The game supplies the Event id and the reason for ending;
+foliot does not infer either from HP or targets. Calling the helper without
+Event support configured is a clear configuration error. In particular,
+`delete_owned_by(entity_id)` remains only a queue operation and never secretly
+closes Events.
+
+Owner-wide deletion does not mean target-wide deletion. If a wolf-owned action
+targets dead Lira, foliot will not discover that through game-owned
+`target_id`; the game or the explicit Event must cancel or close it. This keeps
+the generic store contract free of directed-game assumptions.
 
 ### 10.2 The rendezvous problem is resolved — **DECIDED (closes v1 §8.1)**
 
-v1's blocking question was: how do two parties independently arrive at
-the same `event_key`? Option A was symmetric derivation (both compute
-`combat:` plus the sorted pair of ids); Option B was an explicit event
-entity that one party opens and the other references.
+v1's blocking question was: how do two parties independently arrive at the
+same interaction? Option A was symmetric derivation (both compute `combat:`
+plus the sorted pair of ids); Option B was an explicit event entity that one
+party opens and the other references.
 
-**The game's design answers it: Option B, and the rendezvous largely
-disappears.** The environment *opens* the event and enrols participants,
-so nobody has to guess a key. Consequences:
+**The game's design answers it: Option B, and the rendezvous disappears.** The
+environment *opens* the event and enrols participants. Each participant's
+EventAction carries that explicit `event_id`, so nobody guesses a grouping key.
+Consequences:
 
 - `Event` **is persisted**: it has an identity, a lifetime, and something
   must close it.
-- Option A remains available for incidental interactions where nobody
-  needs to open anything. The two coexist.
+- Opening an Event creates its exact child EventActions and schedules them for
+  a future tick in the same transaction. The children themselves are the
+  expected intent set (§10.1). Suspension is a separate, explicit request made
+  by the game when this Event should interrupt an activity; it is not automatic
+  for every Event.
+- A game may still derive an Event's ID symmetrically for an incidental
+  interaction, but foliot never infers an Event by grouping matching strings.
 - This unblocks the registry and the schema, which v1 flagged as gated.
+- Event state uses the optional EventStore/EventTxn capability but commits in
+  the same physical tick transaction as the ordinary queue and world (§8.3,
+  §8.5); it is never a separately committed repository.
 
 ### 10.3 No reaction pass is needed — **DECIDED**
 
@@ -1604,7 +2052,7 @@ tick pipeline that the design does not have.
 It is not needed, because of one detail in the game's design: the
 forest's roll happens **inside the walking Char's own decide**, and the
 resulting event is **scheduled for the next tick** rather than created
-mid-tick. So the pipeline stays single-pass: decide, group, resolve. No
+mid-tick. So the pipeline stays single-pass: decide, register, resolve. No
 ordering subtlety about who reacts to whom.
 
 ### 10.4 The layer-2 vocabulary
@@ -1613,10 +2061,14 @@ Carried forward from v1, which got this part right:
 
 - **`Intent`** — what an entity wants to do, before anyone knows whether
   it succeeds. Emitted by deciders.
-- **`Event`** — a bundle of intents sharing an `event_key`, resolved
-  together as one unit.
-- **`Outcome`** — everything a resolver produces: `effects`, `schedules`,
-  `cancels`, `log`. Purely descriptive; no side effects.
+- **`Event`** — an explicit persisted interaction that receives intents carrying
+  its `event_id` and resolves them together as one unit through its own
+  game-defined `resolve(ctx, intents)` method. There is no resolver registry.
+- **`Outcome`** — everything `Event.resolve(...)` produces: `effects`, `schedules`,
+  `deletes`, `log`, plus an explicit lifecycle result. A resolver uses
+  `Outcome.continue_with(...)` with fresh next-round children or
+  `Outcome.end(...)`; an empty collection never implicitly closes an Event.
+  Purely descriptive; no side effects.
 - **`Effect`** — a game-defined mutation object with `apply(world)`. The
   only thing permitted to write game state. **The engine calls `apply`
   and knows nothing else** — not `hp`, not `entity_state`, not `amount`.
@@ -1632,8 +2084,8 @@ Carried forward from v1, which got this part right:
 Two deliberate calls worth remembering:
 
 **Effects as objects rather than direct mutation.** Costs a layer of
-indirection. Buys: resolvers stay pure and unit-testable (call with a
-fake world, assert on the return value), effects can be logged as an
+indirection. Buys: Event resolution stays pure and unit-testable (call with a
+fake context and intents, assert on the return value), effects can be logged as an
 audit trail of *why* state changed, and application order becomes
 explicit rather than incidental.
 
@@ -1647,13 +2099,12 @@ deserves its own channel rather than being scraped out of mutations.
 it was superseded except these two, which are not written down anywhere
 else and are worth having when layer 2 is built.
 
-**A solo intent needs no special case.** An intent with no `event_key`
-derives a unique one — `solo:{event_kind}:{actor_id}:{kind}` — which makes
-it a one-participant event. The engine then has exactly one code path:
-group intents by key, resolve each group. There is no branch for "only one
-participant", and therefore no branch that can be wrong. Worth keeping
-because the obvious implementation special-cases the common case and then
-diverges from it.
+**The old solo-intent mechanism is not currently accepted.** The draft gave an
+intent with no event key a derived private event. Under the current boundary,
+an EventAction always references an explicit Event, while a truly solo action
+stays in Layer 1 and directly emits effects or schedules. If a concrete M8 case
+requires a one-participant Event, create that Event explicitly rather than
+adding a second implicit grouping path.
 
 **An intent should remember the action that produced it.** The draft
 carried `source_action_id` so a resolver could cancel the losing branch:
@@ -1693,10 +2144,14 @@ target and deciding what acting against it means remain game responsibilities
 - **EventfulEnvironment** — a place (a forest). It is an entity, so it
   has somewhere to stand when it acts. It acts **only when targeted** —
   a Char walking through it gives it its chance to roll — and it can
-  *spawn events*, which is what makes it "eventful."
+  *spawn events*, which is what makes it "eventful." In this game, Events are
+  created only as an EventfulEnvironment's response to an ordinary action;
+  that is game policy, not a restriction foliot places on other simulations.
 - **Second-order action producers** — a wolf. Spawned by an environment,
-  produces actions only inside an event, and does not exist outside that
-  event at all.
+  alongside the Event that gives it a reason to exist, produces actions only
+  inside that Event, and does not exist outside that Event at all. Its stable
+  id is derived from the Event (§9.5), and its game state is carried by that
+  persisted Event rather than by an independent permanent-world entity row.
 
 **Why this matters to the library.** If only Chars schedule their own
 next action, the queue is a forest of independent per-Char timelines that
@@ -1709,7 +2164,13 @@ cannot enforce this rule, but it should be recorded as a game invariant.
 
 If an event involving another entity is produced — a wolf appears — the
 walking activity is **suspended** and resumes when the battle event is
-over. Poison, hunger and cooldowns continue throughout (§6.2).
+over. Poison, hunger and cooldowns continue throughout (§6.2). Concretely, the
+forest's fight response creates the ephemeral wolf and battle Event together,
+explicitly uses that Event's id as the suspender for Lira's suspendable
+actions, and schedules the Event's Lira and wolf child EventActions. Because
+same-tick scheduling is forbidden, those children first act on a future tick.
+This suspension is FightEvent policy, not behaviour implicit in every Event;
+a simultaneous trade or conversation could leave existing activities active.
 
 ### 11.4 Battle, in the layer-2 vocabulary
 
@@ -1807,6 +2268,43 @@ The example uses `MemoryStore`, a fixed manual seed, and `ManualDriver` for one
 million ticks. It prints a compact summary rather than the whole journal, and
 repeated runs must produce the same final state and journal digest.
 
+### 11.9 M9 Eventworld — **DECIDED**
+
+The optional Event layer is proved by a second bundled consumer under
+`examples/eventworld/`. It remains separate from Tinyworld so the original
+example continues to prove that Layer 1 needs no Event imports or capabilities.
+
+Lira begins a recurring `Walk` through a haunted forest toward the moonlit
+clearing. The forest uses the walk's action RNG and game-owned danger/caution
+formula to decide whether to respond with a fight. Its response derives a
+stable Event id from the walk, derives the temporary wolf's entity id from the
+Event, constructs the concrete `FightEvent` and both first-round children,
+calls `open_event(...)`, and explicitly suspends Lira's walk under that Event
+id. Opening also emits a game effect that records the currently active fight;
+this is game state, not an Event registry supplied by foliot.
+
+`LiraTurn` and `WolfTurn` are game EventActions with mandatory non-null targets.
+They independently choose `Attack`, `DodgeAndHeal`, or `Escape` from tick-start
+state. `FightEvent.resolve(...)` owns the game's hit formula, rolls only the
+Event resolution RNG, and returns either fresh next-round children or an
+explicit ending Outcome. HP, agility, damage, potion rules, targets, combat
+Intents, and the wolf payload therefore remain outside foliot.
+
+Death is checked by the game-owned `FightFinalizer` after a round's effects.
+It deletes actions owned by each dead participant, records the permanent game
+result, and explicitly calls `end_event(...)`. Event cleanup removes current
+or just-staged children and the temporary wolf payload, while a surviving
+Lira's suspended walk resumes through the ordinary suspension mechanism. Its
+`on_resume(paused_for)` hook shifts the game-owned arrival deadline and marks
+that one encounter complete, so the forest does not immediately create the
+same encounter again.
+
+With seed `20260905`, the fight begins at tick 1, Lira drinks her potion at
+tick 6, the wolf dies at tick 11, and Lira arrives at tick 16 with 2 HP. The
+20-tick journal digest is
+`eb43d26dc88ffbaa342b731a1e74623ce42db9b11fbf23f4a376a975c4fb11c3`.
+The example required no new library API.
+
 ---
 
 ## 12. Repository layout and tooling
@@ -1831,16 +2329,21 @@ foliot/
 │       ├── ids.py              # Tick, EntityId, SuspensionId
 │       ├── rng.py              # Rng + counter-based streams
 │       ├── effects.py          # Effect
-│       ├── context.py          # TickContext
+│       ├── context.py          # TickContext + optional TickFinalizer
 │       ├── actions.py          # BaseAction, ActionBinding, ActionState
 │       ├── engine.py           # Simulation: the tick loop
 │       ├── drivers.py          # Driver, ManualDriver, RealtimeDriver
+│       ├── _event_bridge.py    # private optional-layer configuration error
 │       ├── stores/
 │       │   ├── __init__.py     # Store, Txn, MemoryStore export
 │       │   └── memory.py       # in-memory reference implementation
-│       └── events/             # LAYER 2 — optional, added after layer 1
+│       └── events/             # LAYER 2 — explicit optional import
+│           ├── __init__.py     # curated Event API
+│           ├── _api.py         # Event model, Outcomes, IDs, collaborator
+│           └── memory.py       # EventMemoryStore
 ├── examples/
-│   └── tinyworld/              # smallest possible ZPG proving the API
+│   ├── tinyworld/              # Layer-1 public-API proof
+│   └── eventworld/             # optional Layer-2 public-API proof
 └── tests/
 ```
 
@@ -1860,6 +2363,9 @@ foliot/
 - **`examples/tinyworld` is load-bearing, not decoration.** It is the only
   honest test of whether the public API is pleasant, and it should be
   written early enough to still change the API.
+- **`examples/eventworld` keeps Layer 2 honest.** It proves Event opening,
+  simultaneous decisions, continuation, post-effect death finalization,
+  cleanup, and resumption without weakening Tinyworld's no-Event proof.
 
 ### 12.2 Tooling — **DECIDED**
 
@@ -1999,7 +2505,8 @@ Sequenced so each milestone is independently testable.
 | M5 | **Done; 64 tests, Ruff, and basedpyright verified.** `engine.py` + `ManualDriver`; `MemoryStore(initial_actions=...)` bootstrap convenience | M1–M4, §8 | The two-phase tick loop, deterministic apply order, isolated visible handler failures, tick-fatal effect failures, context validation, and inclusive manual fast-forward. Initial in-memory actions are admitted without consuming an artificial tick; this does not widen the `Store` protocol. |
 | M6 | **Done; 86 tests, Ruff, and basedpyright verified.** `RealtimeDriver` | §§4.1, 4.3, 4.4 | Its only public input is positive finite whole or fractional `tick_seconds`; clock/sleep seams stay private. The first tick runs immediately on a fresh cadence. Missed wall-clock slots are skipped; logical ticks are not. Each overrunning tick emits one operational `WARNING`; foliot does not persist or aggregate timing measurements. Downtime pauses simulation time. The driver runs until external interruption and owns no stop mechanism. |
 | M7 | **Done; 88 tests, Ruff, and basedpyright verified.** `examples/tinyworld` | M5 | Lira's fixed-seed world exercises recurring walks, scheduled interval poison, staged damage/healing, and arrival-selected successor actions through public Layer 1 only. Two independent one-million-tick runs produced the same world and journal SHA-256. |
-| M8 | Layer 2: `events/` — intents, grouping, resolvers | M5, §10 | Optional module. Layer 1 must work without it. |
+| M8 | **Done; 114 tests, Ruff, and basedpyright verified.** Layer 2: `events/` — EventActions, intent registration, Event-owned resolution; optional Layer-1 tick finalization and owner-wide deletion | M5, §10 | `Events(store)` opts the existing Simulation into simultaneous resolution through an Event-capable transaction. `EventMemoryStore` is the reference adapter; normal `MemoryStore` and plain `import foliot` remain Event-free. The unchanged million-tick Tinyworld digest re-verifies Layer 1. |
+| M9 | **Done; 116 tests, Ruff, and basedpyright verified.** `examples/eventworld` | M8, §11.9 | One deterministic forest fight proves Event creation, Event-owned ephemeral state, fresh round children, game-owned probability rules, death finalization, exact cleanup, and resumption of Lira's suspended walk. No library API was added. |
 
 **Build `ManualDriver` before `RealtimeDriver`.** The manual driver is
 not a testing afterthought; it is what lets the whole pipeline be
@@ -2173,8 +2680,8 @@ history in the journal, keep the queue small and hot.
 | **Store** | The consumer's persistence adapter: `current_tick`, `due`, `tick_transaction`. |
 | **Tick transaction** | The atomicity boundary. Everything in tick N lands together or not at all. |
 | **Intent** | *(Layer 2)* What an entity wants to do, before anyone knows whether it succeeds. |
-| **Event** | *(Layer 2)* A bundle of intents resolved as one unit. Persisted; has a lifetime. |
-| **Resolver** | *(Layer 2)* `(ctx, event) -> Outcome`. Decides what actually happened. |
+| **Event** | *(Layer 2)* A game object inheriting mandatory `BaseEvent`, with a stable id, exact current child EventActions, and `resolve(...)`. Persisted while open; removed when closed. |
+| **Resolver** | *(Layer 2)* The game-defined `Event.resolve(ctx, intents) -> Outcome` method. Decides what actually happened; not a registry entry or separate required object. |
 | **First-order producer** | *(Game)* A Char. Persists independently; schedules its own actions. |
 | **Second-order producer** | *(Game)* A wolf. Spawned by an environment; exists only inside an event. |
 | **Observer** | The player. Reads the log; cannot act. |
@@ -2262,6 +2769,9 @@ useful here.
   the RNG and orders the journal (§9.4b).
 - `Store` reads and opens; `Txn` writes and must batch; the clock advances
   implicitly on commit (§8.5).
+- `Txn.delete_owned_by(entity_id)` atomically removes all active, suspended,
+  and same-transaction newly scheduled actions owned by an entity; it never
+  infers cleanup from game-owned targets (§8.5, §10.1).
 - `Store` is only the narrow persistence view needed by the engine, not a full
   application repository. Domain-specific setup and external-input operations
   belong to each consumer's concrete adapter and never become foliot methods
@@ -2324,10 +2834,99 @@ useful here.
 
 **Layer 2**
 
+- One `Simulation`, with an optional explicitly supplied events collaborator;
+  no separate `EventSimulation` and no generic plugin framework. Without the
+  collaborator, no event resolution is attempted and ordinary Layer-1
+  behaviour is unchanged (§10.1).
 - Rendezvous resolved: environments open events; `Event` is persisted
   (§10.2).
 - No reaction pass needed (§10.3).
 - Effects as objects; `log` as a first-class `Outcome` field (§10.4).
+- Every valid same-tick effect applies; death is decided by the game's combined
+  post-effect state, not by an intermediate crossing of zero (§10.1).
+- An Event resolves only when all of its expected participants contribute in
+  the same tick. An incomplete attempt is discarded whole, every participant
+  EventAction stays pending, and the next tick makes fresh decisions; partial
+  intents are never combined across tick snapshots (§10.1).
+- The exact child EventActions created when an Event opens are its expected
+  intent set; there is no separately guessed or maintained entity-id set.
+  `entity_id` identifies the actor, while the Intent's source action identity
+  proves which child answered (§10.1, §10.2).
+- EventActions are one-shot round decisions. A resolved continuing round
+  consumes its current children and schedules fresh child objects for the next
+  round, with new permanent `seq` values and a replaced expected set. An
+  incomplete round instead retains and retries its same children (§10.1).
+- Event lifecycle is explicit in the resolver result:
+  `Outcome.continue_with(..., due_tick=...)` supplies fresh next-round children
+  at one required, shared, strictly future tick, and
+  `Outcome.end(...)` deliberately closes the Event, such as after a wolf
+  escapes. Foliot never treats an accidentally empty child list as closure
+  (§10.1, §10.4).
+- A successfully applied ending Outcome automatically resumes only actions
+  carrying that Event id as `suspended_by`, then removes the Event in the same
+  transaction. Opening remains non-suspending unless the game explicitly asks
+  for suspension (§6.2, §8.3, §10.1).
+- Game EventActions implement `decide(DecisionContext) -> Intent`; the context
+  exposes only `tick` and the action-bound `rng`. Foliot attaches `event_id`
+  and source `seq`, while effects, scheduling, lifecycle commands, and outcome
+  logs remain resolver responsibilities (§10.1).
+- Shared uncertainty during resolution uses a separate Event-owned,
+  counter-based stream derived from world seed, persisted deterministic Event
+  id, tick, and an event-resolution domain tag. `ResolutionContext` exposes
+  only `tick` and that `rng`; every probability formula remains game code
+  (§9.1, §10.1).
+- Concrete game Events own `resolve(ctx, intents) -> Outcome`; foliot calls the
+  method directly and maintains no resolver registry. Large formulas may be
+  delegated to an ordinary game-owned service (§10.1).
+- `BaseEvent` is mandatory and owns only the universal stable id, current child
+  set, child replacement, and removal lifecycle. Game subclasses retain all
+  payload and resolution behaviour. Events are not queued and therefore do not
+  copy Action deadlines, suspension, or state; open means present and closed
+  means removed (§10.1).
+- A BaseEvent receives its final deterministic id at construction because its
+  ephemeral entities, child EventActions, and explicit suspension requests
+  need that id before persistence. The store rejects duplicates but never
+  replaces the id. Game-declared `EventIdTemplate` and `EntityIdTemplate`
+  constants derive opaque stable ids from typed parent identities and explicit
+  ordinals; class names and handwritten ID formatting are never used (§10.1).
+- `open_event(event, due_tick)` atomically persists the Event and its payload,
+  admits all declared children at one shared future tick, and makes those exact
+  bound children the expected set. Games do not schedule them individually;
+  suspension remains a separate explicit request (§8.3, §10.1).
+- Event-producing actions explicitly import `open_event` from `foliot.events`
+  and call `open_event(ctx, event, due_tick=...)`. Ordinary `TickContext` has no
+  Event methods, and using the function without an Event collaborator produces
+  a clear configuration error (§10.1).
+- Post-effect finalization explicitly imports
+  `end_event(ctx, event_id)` from `foliot.events` when game rules require an
+  Event to end, such as participant death. It uses the same cleanup and wake-up
+  path as `Outcome.end(...)`; `delete_owned_by(...)` never implies Event
+  closure (§10.1).
+- Resolver formulas read the frozen tick-start state. Same-tick Poison, Hunger,
+  healing, and combat effects influence later rounds only after the common
+  apply boundary; iteration order never changes the stats used (§10.1).
+- A resolver exception or invalid Outcome is visibly reported and isolated to
+  that Event before writes: its attempt is discarded, its current children
+  remain pending, and unrelated work commits. An Outcome Effect failure occurs
+  during application and remains fatal to the whole tick (§8.3, §10.1).
+- Event-enabled adapters structurally extend the ordinary Store/Txn protocols
+  and persist Events in the same physical tick transaction. No-event adapters
+  remain unchanged. The added capabilities are `EventStore.event(event_id)`
+  and `EventTxn.event_open(...)`, `event_continue(...)`, and `event_end(...)`
+  (§8.3, §8.5).
+- Event opening never suspends participants automatically. The game explicitly
+  requests suspension when appropriate and uses the Event id as the waking
+  handle; successfully closing that Event automatically resumes every action
+  held by that exact handle. Closing removes the Event, its current children,
+  and all Event-owned ephemeral payload together; committed effects and journal
+  history remain. In the motivating fight, the forest response creates the
+  Event-owned wolf, whose lifetime and persisted state belong to that
+  FightEvent (§9.5, §11.2, §11.3).
+- An optional game-owned `TickFinalizer` runs after all valid ordinary-Action
+  and Event Outcome effects and before commit through a narrow collecting
+  context. It may issue effects, schedules, deletions, owner-wide deletion, and
+  logs; failure aborts the tick. Foliot has no death or HP concept (§8.3,
+  §10.1).
 
 **Project**
 
@@ -2344,7 +2943,7 @@ useful here.
 
 ### Immediate next work
 
-M0 through M7 are **done**. M2 provides mandatory `BaseAction`, including its
+M0 through M9 are **done**. M2 provides mandatory `BaseAction`, including its
 opaque owner `entity_id`, `Unbound | Bound`,
 `Active | Suspended`, stable binding/rescheduling, and the pause shift with
 `on_resume(paused_for)` (§6.4). M3 provides explicit secure world-seed creation,
@@ -2422,8 +3021,29 @@ one-million-tick runs produced the same final HP of 20, 191,236-entry journal,
 7,358 potion uses, and SHA-256
 `cb4c08c2bab9c7c4c388ac3a71208da36d5f241792ef4006c849eaaa2a65958e`.
 
-Next is M8, the separate optional events layer. Its intents, event grouping,
-and resolvers must add simultaneity without making Layer 1 depend on it.
+M8 supplies the separate optional Event layer. `EventAction.decide()` registers
+one Intent through the library-owned process bridge; complete same-tick sets
+resolve through their concrete `BaseEvent`, Event-owned RNG, and explicit
+continuing or ending Outcome. `Events(store)` connects this path to the one
+`Simulation`; `EventMemoryStore` implements both store protocols on one
+transaction. `open_event` and `end_event` remain explicit imports, while plain
+`foliot`, ordinary `TickContext`, and `MemoryStore` stay Event-free. M8 also
+supplies the separately optional Layer-1 `TickFinalizer` and
+`Txn.delete_owned_by(entity_id)`. The complete 114-test suite, strict typing,
+linting, order reversal, rollback cases, and unchanged one-million-tick
+Tinyworld digest verify the milestone.
+
+M9 supplies the separate `examples/eventworld` Layer-2 proof. Its forest
+creates a Fight Event and temporary wolf, explicitly suspends Lira's walk, and
+lets both combatants choose fresh Intents for each simultaneous round. Combat
+and death remain game rules: the FightEvent owns the probability formula and
+the game finalizer closes the Event after post-effect death. The fixed-seed
+story removes the dead wolf and staged next-round actions, resumes Lira's same
+walk, and reaches the moonlit clearing with its deadline shifted by exactly
+the pause. The complete 116-test suite verifies both examples.
+
+No M10 has been selected. The next milestone should be discussed rather than
+inferred from the two deliberately deferred project questions above.
 
 ---
 
@@ -2448,6 +3068,7 @@ Losing the reasoning is the only real cost of overwriting a document.
 | **Action granularity is open**: is one action one narrative beat? | **Intermediate decision:** the *activity* is the narrative beat and its actions are machinery; later superseded by the no-groups decision below. | This answer produced the proposed `group_id`. §10.3 later established that a walk is one queued action, removing the machinery and the bundle together; the current answer is §6.3: the suspendable action itself is the narrative beat. |
 | A **reaction pass** may be needed so targeted entities can act. | **Not needed.** | The environment rolls inside the walking Char's own decide, and schedules the resulting event for the next tick. The pipeline stays single-pass. |
 | Intents/events/resolvers are **the framework layer** (core, central). | **Layer 2 — a separate, optional module.** | Layer 1 must be complete and useful alone, or foliot is a framework with a mandatory opinion rather than a library. Layer 2 still earns inclusion because it adds simultaneity. |
+| Strict Layer separation suggested a second event-aware simulation engine or a generic plugin seam. | **One `Simulation` accepts one explicit optional events collaborator.** | A second public engine would duplicate tick semantics and could drift on failures, validation, finalization, or atomicity; a generic module system solves a problem foliot does not have. With no collaborator, no event work runs, ordinary Layer-1 behaviour is identical, and the drivers remain entirely event-blind. |
 | `docs/reference/protocols-draft.py` is the reference shape. | **Superseded, then deleted at M1.** | `Action` changed shape entirely (§7.1), the draft assigned core behaviour to targets, and the two-layer split changed what belongs where. Keeping it cost a lint exclusion and left a wrong shape in the tree for someone to copy. Its two surviving ideas — solo-intent keys and `source_action_id` — are now in §10.5, and `git show 1d22a00:docs/reference/protocols-draft.py` has the rest. Deleting a file is not losing it; failing to extract its reasoning first would have been. |
 | **`mypy --strict`** is the type checker (§12.2). | **`basedpyright` in strict mode.** | Two behaviours mypy does not offer, both demonstrated during M0. `enableTypeIgnoreComments = false` makes `# type: ignore` stop silencing anything, so a suppression cannot be smuggled in. And `reportMatchNotExhaustive` names the unhandled member when a `match` misses a case — which is what turns adding an `ActionState` member into a compile error at every call site instead of a silent fallthrough. Corollary rule: a `case _:` branch, *even one that raises*, disables that check completely — verified, zero errors reported — so catch-alls are banned. |
 | **`requires-python = ">=3.11"`** — widest reach; PEP 695 buys foliot little because its protocols are not generic. | **`>=3.12`.** | Reversed after reading a mature in-house Python codebase whose style the owner wants to match. PEP 695 (`type Tick = int`, `class Store[A](Protocol):`) and `@typing.override` are the visible part of that style, and `override` cannot be had on 3.11 without `typing_extensions` — a dependency, which is forbidden. Cost: Debian 12's system Python (3.11) is excluded; Ubuntu 24.04 LTS (3.12) is not. The floor is enforced mechanically rather than by care — ruff infers its target from `requires-python`, so 3.13+ syntax fails to lint on a 3.14 dev machine (verified with PEP 696 defaults). |

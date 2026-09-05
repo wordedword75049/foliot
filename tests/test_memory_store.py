@@ -273,6 +273,24 @@ def test_delete_should_remove_active_and_suspended_actions() -> None:
     assert store.due(100) == ()
 
 
+def test_delete_owned_by_should_include_actions_scheduled_in_the_same_transaction() -> None:
+    store = MemoryStore[World]({}, 1)
+    first = ExampleAction("first", entity_id=EntityId("lira"))
+    second = ExampleAction("second", entity_id=EntityId("lira"))
+    unrelated = ExampleAction("unrelated", entity_id=EntityId("wolf"))
+
+    with store.tick_transaction(0) as txn:
+        txn.schedule(first, 10)
+        txn.delete_owned_by(EntityId("lira"))
+        txn.schedule(second, 20)
+        txn.schedule(unrelated, 20)
+
+    assert store.due(100) == (unrelated,)
+    assert first.binding == Bound(1, Active(10))
+    assert second.binding == Bound(2, Active(20))
+    assert unrelated.binding == Bound(3, Active(20))
+
+
 def test_schedule_should_reject_current_or_past_deadline() -> None:
     store = MemoryStore[World]({}, 1, current_tick=5)
 

@@ -78,6 +78,154 @@ adapter's own suite must additionally prove that its game-world writes roll
 back. `MemoryStore` cannot make that last assertion for an arbitrary mutable
 Python world and must not pretend otherwise (§8.5).
 
+Test optional tick finalization at the boundary rather than through one game's
+idea of death. The finalizer must observe the world after all valid
+ordinary-Action and Event Outcome effects; its effects, schedules, deletions,
+owner-wide deletions, and logs must land before the same commit. A raising
+finalizer must leave the tick unfinished
+and roll back every foliot-owned change. `delete_owned_by(entity_id)` must
+remove active, suspended, and newly scheduled actions owned by that entity,
+while preserving actions owned by someone else even when their game payload
+targets it. Target cleanup belongs to the game or its explicit Event, not to
+the generic store.
+
+With Layer 2 enabled, exercise an explicit
+`from foliot.events import end_event` call from finalization. It must use the
+same cleanup path as `Outcome.end(...)`, including removal of next-round
+children staged earlier in that tick and wake-up by the exact Event id. Prove
+that `delete_owned_by(entity_id)` alone does not close an Event, that the game
+must supply the Event id, and that `end_event(...)` without configured Event
+support raises a clear configuration error.
+
+For M8, make a two-participant Event where one EventAction raises after the
+other successfully produces an intent. Assert that the Event does not resolve,
+neither current-tick intent is retained, both original actions remain pending
+exactly once with their permanent sequence numbers, and the clock still
+commits the otherwise valid tick. On the next tick both actions must run again
+with fresh contexts and fresh RNG streams, and only that same-tick pair may
+resolve. This prevents accidental mixtures of decisions made against different
+world snapshots.
+
+Contrast that retry with a successfully resolved continuing Event. Its current
+children must be consumed exactly once, a fresh deterministic-order set must be
+scheduled for a future tick, and those new objects must receive new permanent
+sequence numbers. On that future tick their decisions must observe the prior
+round's applied state. This catches the tempting but incorrect optimization of
+rescheduling one combat-turn object across multiple resolved rounds.
+
+Test an EventAction's `decide()` directly with a tiny fake
+`DecisionContext` containing only `tick` and a fixed `Rng`. Assert on the one
+game Intent it returns. At the integration boundary, prove foliot attaches the
+correct `event_id` and permanent source `seq`, and treats an exception or a
+missing Intent as an incomplete Event attempt. Do not give the fake effect,
+scheduling, lifecycle, log, world, store, or registry methods; their absence is
+the capability boundary under test.
+
+Give resolvers a separate fake `ResolutionContext` with only `tick` and `rng`.
+Golden tests must prove an Event-resolution stream replays for the same world
+seed, Event id, and tick; changes when Event id or tick changes; and is domain-
+separated from every participant action stream. Resolve independent Events in
+reversed order and assert identical per-Event outcomes. Combat probability
+tests belong to the game and should inject a fixed RNG into the game formula;
+foliot must not grow agility, HP, hit-chance, or `chance()` concepts.
+
+Call each concrete Event's `resolve()` directly in unit tests with a fake
+`ResolutionContext` and explicit Intent records, then assert on its returned
+Outcome. No resolver registry fake, kind lookup, or registration fixture should
+exist. A game that delegates to a rules service tests that service as ordinary
+game code.
+
+Test `BaseEvent` through a concrete game subclass and keep every game field on
+that same object across opening and child replacement. Opening exposes its
+exact admitted children; a resolved continuing round replaces them; closing
+removes the Event instead of setting a status. Tests must not invent an Event
+deadline, suspension state, tombstone, or wrapper object.
+
+Test lifecycle through the two explicit Outcome forms. A continuing fight must
+use `Outcome.continue_with(..., due_tick=...)` and admit every supplied fresh
+child at that one shared deadline; a wolf escape must use `Outcome.end(...)`
+and remove the Event. The continuation deadline must be strictly future. An
+empty or forgotten next-child collection must never be interpreted as an
+implicit request to end.
+Successful ending must also resume every action suspended by that exact Event
+id using the normal pause shift, remove its current children and Event-owned
+ephemeral payload, and leave actions held by other ids alone. Committed effects
+and journal history remain. A non-interrupting Event must close as a harmless
+no-op for suspension. Prove that an application or finalization failure rolls
+back cleanup and wake-up, and that same-transaction owner deletion leaves no
+resumed action behind.
+
+If a game wants data derived from an ephemeral Event entity to outlive the
+Event, its ending Outcome must explicitly create that permanent game state.
+Closing must never leave the Event's temporary payload behind merely because a
+game still holds an old Python reference to it.
+
+In the game-level simultaneity test, start Lira at 6 HP, contribute Poison
+damage in the same tick as a dodge calculation, and run the due actions in both
+orders. The resolver must use 6 HP in both runs; Poison applies afterward and
+changes the state observed by the next round. This test must fail if effects
+are applied while due actions or Events are still deciding.
+
+Make one resolver raise after constructing part of an Outcome. Assert that an
+operational `ERROR` contains tick, Event id, resolver identity, and traceback;
+that no part of its Outcome or story log survives; that its same Event and
+current children remain pending exactly once; and that unrelated actions and
+Events commit. The next tick must use fresh participant contexts. Contrast
+this with a raising Effect from a valid Outcome: it must escape, leave the tick
+unfinished, and roll back every foliot-owned change.
+
+The event-capable in-memory store must prove one physical commit boundary:
+inject a failure after staging an Event and ephemeral payload, suspension, and
+child schedules, then assert that none survives and the clock does not move.
+Verify the successful inverse too. The ordinary `MemoryStore` test
+surface must remain unchanged and contain no Event methods. A durable adapter's
+own suite must run the equivalent rollback test against its one database
+transaction rather than coordinating two repositories.
+
+Construct a BaseEvent with a deterministic id before opening it, and assert
+that its ephemeral entity ids, child `event_id` fields, and suspension handle
+can all derive from that value while the children remain unbound. Opening must
+preserve the Event id, bind the children normally, and reject a duplicate id
+atomically. Derivation tests must use the reusable typed templates;
+do not bless handwritten `"fight:..."` or `"wolf:..."` strings as public API.
+Golden vectors must cover `EventIdTemplate.from_action(...)` and
+`EntityIdTemplate.from_event(...)`, namespace separation, different parent
+identities and ordinals, non-ASCII length framing, cross-process stability, and
+the distinct `EventId` / `EntityId` result types. No test may derive a
+namespace from a Python class or module name.
+
+Test `open_event(event, due_tick)` as one admission request. Success must
+persist the concrete Event and payload, bind every declared child in
+deterministic order, schedule all at the same future tick, and establish those
+exact children as the expected set. A non-future tick and duplicate Event id
+must fail without leaving any child bound or Event persisted. Opening alone
+must not suspend anything; test suspension as a separate command in the same
+source context. The defensive admission boundary also rejects an empty child
+set, the same child object twice, a child carrying another Event id, or an
+already-bound child; these checks only prevent an Event that could never form
+the agreed exact intent set.
+
+Exercise Event opening through the explicit
+`from foliot.events import open_event` boundary and a normal `TickContext`.
+Prove that the ordinary context protocol exposes no Event method, that the
+function reaches the configured Event collaborator, and that calling it
+without Event support fails with a clear configuration error. Do not create a
+second Event-specific context or action-processing signature for tests.
+
+Run the same ordinary-action scenario through `Simulation(store)` and through
+the event-enabled configuration with no EventActions due. Assert identical
+effects, schedules, deletions, journal order, finalization, clock advancement,
+and final world. Also prove that the configuration without an events
+collaborator never calls event persistence or resolution. This guards the
+promise that Layer 2 adds one path rather than changing Layer 1.
+
+Opening a non-interrupting Event must leave existing suspendable actions
+active. A FightEvent test must explicitly request suspension, prove that only
+the chosen entity's suspendable actions pause under the Event id, and prove
+that non-suspendable poison or hunger continues. Its environment response must
+create the Event-owned ephemeral opponent and both exact child EventActions in
+the same committed tick; rollback must leave none of them behind.
+
 ## Fakes, not mocks
 
 **`unittest.mock` is forbidden in this repository.** So are `pytest-mock` /

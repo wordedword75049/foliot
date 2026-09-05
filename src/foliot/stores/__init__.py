@@ -62,6 +62,14 @@ class Txn[W](Protocol):
         """Finished or invalidated actions are removed, not tombstoned (§5.5)."""
         ...
 
+    def delete_owned_by(self, entity_id: EntityId, /) -> None:
+        """Remove every action owned by one entity in this transaction.
+
+        This includes active, suspended, and newly scheduled actions. It never
+        follows game-owned target fields and never closes an Event implicitly.
+        """
+        ...
+
     def suspend(self, entity_id: EntityId, by: SuspensionId, /) -> None:
         """Suspend every suspendable action this entity owns, tagged with `by`."""
         ...
