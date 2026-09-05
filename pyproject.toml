@@ -14,15 +14,38 @@ keywords = ["simulation", "scheduler", "tick", "deterministic", "event-queue"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Games/Entertainment :: Simulation",
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
 
+[project.urls]
+Homepage = "https://github.com/wordedword75049/foliot"
+Documentation = "https://github.com/wordedword75049/foliot/blob/main/docs/index.md"
+Repository = "https://github.com/wordedword75049/foliot.git"
+Issues = "https://github.com/wordedword75049/foliot/issues"
+Changelog = "https://github.com/wordedword75049/foliot/blob/main/CHANGELOG.md"
+
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = [
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "RELEASING.md",
+    "docs/**",
+    "examples/**",
+    "tests/**",
+    "uv.lock",
+]
+source-exclude = ['/docs/Claude-ZPG\ hobby\ project-*.md']
 
 [dependency-groups]
 dev = [

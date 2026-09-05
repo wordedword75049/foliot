@@ -21,7 +21,24 @@ __all__ = ["EventMemoryStore"]
 
 
 class EventMemoryStore[W]:
-    """The in-memory reference adapter for the optional Event layer."""
+    """Dependency-free in-memory Store with Event capabilities.
+
+    This is the Event-enabled counterpart to `MemoryStore`, intended for tests,
+    examples, and temporary simulations. Event changes share the core memory
+    transaction and publish only after a clean exit.
+
+    Args:
+        world: Mutable game-owned world exposed through each transaction.
+        world_seed: Persisted unsigned 128-bit seed.
+        current_tick: Next unfinished logical tick.
+        initial_actions: Ordered `(action, due_tick)` pairs admitted without a
+            setup tick.
+
+    Note:
+        Like `MemoryStore`, this adapter cannot generically roll back direct
+        mutations of an arbitrary game-owned Python object. Stage mutations as
+        effects.
+    """
 
     __slots__ = ("_events", "_store")
 
@@ -43,19 +60,24 @@ class EventMemoryStore[W]:
 
     @property
     def world_seed(self) -> int:
+        """Persisted unsigned 128-bit seed for this world."""
         return self._store.world_seed
 
     @property
     def logs(self) -> tuple[tuple[Tick, str], ...]:
+        """Committed deterministic journal entries in insertion order."""
         return self._store.logs
 
     def current_tick(self) -> Tick:
+        """Return the next unfinished logical tick."""
         return self._store.current_tick()
 
     def due(self, tick: Tick, /) -> tuple[BaseAction[W], ...]:
+        """Return bound actions due at or before `tick`, plus recurring work."""
         return self._store.due(tick)
 
     def event(self, event_id: EventId, /) -> BaseEvent[W] | None:
+        """Return the open Event with `event_id`, or `None`."""
         return self._events.get(event_id)
 
     def event_snapshot(self) -> dict[EventId, BaseEvent[W]]:
@@ -63,6 +85,7 @@ class EventMemoryStore[W]:
         return self._events.copy()
 
     def tick_transaction(self, tick: Tick, /) -> AbstractContextManager[Txn[W]]:
+        """Open an atomic in-memory boundary for one logical tick."""
         return _EventMemoryTransactionContext(self, self._store.tick_transaction(tick))
 
     def publish_events(

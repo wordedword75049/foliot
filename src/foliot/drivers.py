@@ -1,4 +1,4 @@
-"""Who decides when the next tick happens (§4.2).
+"""Pacing strategies for the simulation loop.
 
 `process_tick()` never waits. That split is the whole reason the same code path
 runs at one tick per second in production and at ten million ticks per second in
@@ -24,7 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class Driver(Protocol):
-    """Paces the loop. Injected, never constructed by the engine."""
+    """Structural pacing contract consumed by `Simulation.run()`."""
 
     def wait_for(self, tick: Tick, /) -> None:
         """Block until `tick` should begin.
@@ -32,9 +32,7 @@ class Driver(Protocol):
         `ManualDriver` returns at once. `RealtimeDriver` sleeps toward an
         absolute cadence target -- `start + slot * duration` -- never a
         relative one. Cadence slots may be skipped after an overrun; logical
-        ticks may not. Sleeping "the rest of the second" accumulates the
-        overhead of waking, measuring and sleeping again, which at 2 ms per
-        tick is roughly ninety minutes of drift per month, silently (§4.1).
+        ticks may not.
         """
         ...
 
@@ -45,7 +43,15 @@ class Driver(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ManualDriver:
-    """Run immediately through an inclusive target tick."""
+    """Run immediately through an inclusive target tick.
+
+    Args:
+        until_tick: Last logical tick to process. Must be non-negative.
+
+    Raises:
+        TypeError: If `until_tick` is not an integer or is a boolean.
+        ValueError: If `until_tick` is negative.
+    """
 
     until_tick: Tick
 
@@ -70,6 +76,16 @@ class RealtimeDriver:
     The object is intentionally stateful: it remembers one run's cadence
     anchor, current wall-clock slot, and most recently started logical tick.
     Create a new driver to establish a fresh cadence after restart.
+
+    Args:
+        tick_seconds: Positive finite number of seconds between cadence slots.
+            Whole and fractional values are supported.
+
+    Raises:
+        TypeError: If `tick_seconds` is not an integer or float, or is a
+            boolean.
+        ValueError: If it is zero, negative, infinite, NaN, or too large to
+            represent as a finite float.
     """
 
     __slots__ = (

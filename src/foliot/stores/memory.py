@@ -1,4 +1,4 @@
-"""Dependency-free reference storage for tests and quickstarts (§8, M4).
+"""Dependency-free reference storage for tests and quickstarts.
 
 `MemoryStore` implements the same `Store` / `Txn` behavior a consumer-owned
 durable adapter must provide, but keeps the actual game action objects in
@@ -87,6 +87,24 @@ class MemoryStore[W]:
     Optional `initial_actions` are admitted during construction without
     advancing the clock; this concrete bootstrap convenience is deliberately
     absent from the engine-facing `Store` protocol.
+
+    Args:
+        world: Mutable game-owned world exposed through each transaction.
+        world_seed: Persisted unsigned 128-bit seed.
+        current_tick: Next unfinished logical tick.
+        initial_actions: Ordered `(action, due_tick)` pairs admitted without
+            processing a setup tick. `None` means recurring.
+
+    Raises:
+        TypeError: If the seed or current tick has the wrong runtime type.
+        ValueError: If values are out of range, an action is repeated, or an
+            initial deadline precedes `current_tick`.
+        RuntimeError: If an initial action is already bound.
+
+    Note:
+        Queue state, bindings, logs, and the clock roll back on failure. Direct
+        mutations of an arbitrary game-owned Python object cannot be rolled
+        back generically; stage world changes as effects.
     """
 
     __slots__ = ("_state",)
@@ -139,7 +157,7 @@ class MemoryStore[W]:
         return self._state.current_tick
 
     def due(self, tick: Tick, /) -> tuple[BaseAction[W], ...]:
-        """Return a stable snapshot of active recurring and due actions."""
+        """Return active recurring, due, and overdue actions in `seq` order."""
         _validate_tick(tick, name="tick")
         actions = list(self._state.recurring.values())
         for due_tick, bucket in self._state.scheduled.items():
@@ -149,7 +167,13 @@ class MemoryStore[W]:
         return tuple(actions)
 
     def tick_transaction(self, tick: Tick, /) -> _MemoryTransactionContext[W]:
-        """Open the one transaction allowed for the store's current tick."""
+        """Open the one transaction allowed for the store's current tick.
+
+        Raises:
+            ValueError: If `tick` is invalid or is not the next unfinished
+                tick.
+            RuntimeError: If another memory transaction is already open.
+        """
         _validate_tick(tick, name="tick")
         return _MemoryTransactionContext(self._state, tick)
 

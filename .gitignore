@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+.DS_Store
+docs/Claude-ZPG hobby project-*.md
 __pycache__/
 *.py[codz]
 *$py.class
@@ -169,6 +171,7 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+.basedpyright/
 .dmypy.json
 dmypy.json
 

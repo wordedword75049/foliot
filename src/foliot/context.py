@@ -1,4 +1,4 @@
-"""What handlers and finalizers are handed.
+"""Capabilities supplied to action handlers and tick finalizers.
 
 `TickContext` is deliberately narrow: two things to read and five things to say.
 It is the one object every handler touches, which makes it the one object most
@@ -39,9 +39,8 @@ class TickContext[W](Protocol):
 
     Only once every due action has been asked does the engine drain the pile:
     schedules and suspension requests into the queue, effects applied, log
-    lines written. So no action can observe another's changes within a tick,
-    which is what makes a tick's actions safe to process in any iteration order
-    (§2).
+    lines written. No action can therefore observe another action's effects
+    from the same tick.
 
     `tick` and `rng` are read-only properties rather than plain annotations: a
     Protocol written `tick: Tick` demands something *settable*, which a real
@@ -58,28 +57,36 @@ class TickContext[W](Protocol):
         ...
 
     def emit(self, effect: Effect[W], /) -> None:
-        """Stage a change to the world. Applied after the whole loop."""
+        """Stage a game-defined world mutation for the apply phase.
+
+        Args:
+            effect: Object whose `apply(world)` method performs the mutation.
+        """
         ...
 
     def schedule(self, action: BaseAction[W], due_tick: Tick | None, /) -> None:
-        """Queue an action. `None` makes it recurring -- it runs every tick and
-        stores no deadline, because for it the next due tick is always `now + 1`
-        (§5.7).
+        """Queue a new action or reschedule an active one.
 
-        A concrete `due_tick` must be strictly in the future. Scheduling into
-        the current tick lands in a bucket the engine has already read, so
-        whether anything else sees it depends on who ran first (§5.6).
-        Implementations reject it.
+        Args:
+            action: Action object to admit or reschedule.
+            due_tick: Strictly future deadline, or `None` for execution on
+                every tick.
+
+        Raises:
+            TypeError: If a deadline is not an integer or `None`.
+            ValueError: If a concrete deadline is not later than `tick`.
         """
         ...
 
     def log(self, line: str, /) -> None:
         """Write one line of narrative for the observer.
 
-        A first-class channel rather than something scraped out of effects: in
-        a zero-player game the log *is* the product (§10.4). Lines are written
-        in `seq` order, not processing order, so two runs of one seed produce
-        the same story as well as the same world.
+        Lines are written in permanent action-sequence order rather than store
+        iteration order.
+
+        Args:
+            line: Complete game-facing narrative line. Foliot does not format
+                or localize it.
         """
         ...
 
@@ -90,7 +97,12 @@ class TickContext[W](Protocol):
         *,
         by: SuspensionId | EventId,
     ) -> None:
-        """Pause the entity's suspendable actions under one waking handle."""
+        """Pause an entity's suspendable actions under one waking handle.
+
+        Args:
+            entity_id: Owner whose suspendable actions should pause.
+            by: Stable handle used for the later matching resume.
+        """
         ...
 
     def finish(self) -> None:
@@ -111,20 +123,38 @@ class FinalizationContext[W](Protocol):
     """
 
     @property
-    def tick(self) -> Tick: ...
+    def tick(self) -> Tick:
+        """Logical tick currently being finalized."""
+        ...
 
-    def emit(self, effect: Effect[W], /) -> None: ...
+    def emit(self, effect: Effect[W], /) -> None:
+        """Stage one final effect for application in this transaction."""
+        ...
 
-    def schedule(self, action: BaseAction[W], due_tick: Tick | None, /) -> None: ...
+    def schedule(self, action: BaseAction[W], due_tick: Tick | None, /) -> None:
+        """Stage an action for a future tick, or as recurring work."""
+        ...
 
-    def delete(self, action: BaseAction[W], /) -> None: ...
+    def delete(self, action: BaseAction[W], /) -> None:
+        """Remove one action from all future due snapshots."""
+        ...
 
-    def delete_owned_by(self, entity_id: EntityId, /) -> None: ...
+    def delete_owned_by(self, entity_id: EntityId, /) -> None:
+        """Remove all actions owned by one entity."""
+        ...
 
-    def log(self, line: str, /) -> None: ...
+    def log(self, line: str, /) -> None:
+        """Append one deterministic journal line for this tick."""
+        ...
 
 
 class TickFinalizer[W](Protocol):
-    """Optional game-owned post-effect lifecycle policy."""
+    """Optional game-owned policy run after a tick's normal effects.
 
-    def finalize(self, world: W, ctx: FinalizationContext[W], /) -> None: ...
+    Use a finalizer for rules that depend on the combined post-effect world,
+    such as death or cleanup. A raised exception aborts the tick transaction.
+    """
+
+    def finalize(self, world: W, ctx: FinalizationContext[W], /) -> None:
+        """Inspect `world` and stage any final lifecycle work in `ctx`."""
+        ...

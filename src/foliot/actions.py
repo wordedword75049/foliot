@@ -1,4 +1,4 @@
-"""Actions: game behaviour with engine-owned lifecycle bookkeeping (§6, §7).
+"""Game actions with engine-owned lifecycle bookkeeping.
 
 Every game action that enters foliot's queue inherits `BaseAction`. This is
 deliberately different from the library's structural ports: binding, stable
@@ -31,7 +31,12 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class Active:
-    """An admitted action eligible to run according to its queue shape."""
+    """Queue state of an admitted action that is eligible to run.
+
+    Attributes:
+        due_tick: Future deadline, or `None` for an action due every tick.
+        status: Stable discriminator useful when persisting the state.
+    """
 
     due_tick: Tick | None
     status: Literal["active"] = field(default="active", init=False)
@@ -39,7 +44,15 @@ class Active:
 
 @dataclass(frozen=True, slots=True)
 class Suspended:
-    """An admitted action paused by one event or other opaque suspender."""
+    """Queue state of an admitted action that is temporarily paused.
+
+    Attributes:
+        suspended_at: Tick at which the pause began.
+        suspended_by: Handle that must be used to resume the action.
+        due_tick: Deadline preserved from the active state, or `None` for a
+            recurring action.
+        status: Stable discriminator useful when persisting the state.
+    """
 
     suspended_at: Tick
     suspended_by: SuspensionId
@@ -61,7 +74,11 @@ class Bound:
 
     `seq` is assigned once, on first admission, and is carried unchanged through
     every replacement of `state`. It is the action's replay identity, not its
-    position in a due list (§9.4b).
+    position in a due list.
+
+    Attributes:
+        seq: Positive sequence number assigned by the store.
+        state: Current active or suspended queue state.
     """
 
     seq: int
@@ -77,6 +94,10 @@ class BaseAction[W](ABC):
     The base owns only the lifecycle fields foliot needs. Subclasses keep all
     game-owned payload -- target, poison damage, tick interval, arrival
     deadline, and so on -- on the same object and implement `process()`.
+
+    Args:
+        entity_id: Opaque identity of the entity that owns the action.
+        suspendable: Whether owner-level suspension requests may pause it.
     """
 
     __slots__ = ("_binding", "_entity_id", "_suspendable")
@@ -93,7 +114,7 @@ class BaseAction[W](ABC):
 
     @property
     def suspendable(self) -> bool:
-        """Whether an interruption pauses this action (§6.2)."""
+        """Whether an owner-level suspension request may pause this action."""
         return self._suspendable
 
     @property
@@ -103,7 +124,11 @@ class BaseAction[W](ABC):
 
     @property
     def seq(self) -> int:
-        """Stable replay identity assigned once by the store (§9.4b)."""
+        """Return the permanent sequence number assigned by the store.
+
+        Raises:
+            RuntimeError: If the action has not been admitted yet.
+        """
         match self._binding:
             case Bound(seq=seq):
                 return seq
@@ -112,7 +137,11 @@ class BaseAction[W](ABC):
 
     @property
     def state(self) -> ActionState:
-        """Current queue state of an admitted action."""
+        """Return the active or suspended state of an admitted action.
+
+        Raises:
+            RuntimeError: If the action has not been admitted yet.
+        """
         match self._binding:
             case Bound(state=state):
                 return state
@@ -125,6 +154,13 @@ class BaseAction[W](ABC):
         Durable stores also use this operation when hydrating an admitted
         action. Calling it twice would replace the replay identity and is
         therefore rejected.
+
+        Args:
+            seq: Permanent sequence number allocated by the store.
+            state: Restored active or suspended queue state.
+
+        Raises:
+            RuntimeError: If the action is already bound.
         """
         match self._binding:
             case Unbound():
@@ -133,7 +169,14 @@ class BaseAction[W](ABC):
                 raise RuntimeError("an action can only be bound once")
 
     def reschedule(self, due_tick: Tick | None, /) -> None:
-        """Replace an active deadline while preserving the action's `seq`."""
+        """Replace an active deadline while preserving the action's `seq`.
+
+        Args:
+            due_tick: New deadline, or `None` for recurring execution.
+
+        Raises:
+            RuntimeError: If the action is unbound or suspended.
+        """
         match self._binding:
             case Bound(seq=seq, state=state):
                 match state:
@@ -145,7 +188,17 @@ class BaseAction[W](ABC):
                 raise RuntimeError("an unbound action must be bound before rescheduling")
 
     def suspend(self, tick: Tick, by: SuspensionId, /) -> None:
-        """Pause this action, preserving its deadline and replay identity."""
+        """Pause this action, preserving its deadline and replay identity.
+
+        Non-suspendable and already-suspended actions are unchanged.
+
+        Args:
+            tick: Tick at which the pause begins.
+            by: Opaque handle that owes the later resumption.
+
+        Raises:
+            RuntimeError: If the action has not been admitted yet.
+        """
         if not self._suspendable:
             return
 
@@ -167,7 +220,17 @@ class BaseAction[W](ABC):
                 raise RuntimeError("an unbound action cannot be suspended")
 
     def resume(self, tick: Tick, /) -> None:
-        """Resume this action and shift its deadlines by the pause length."""
+        """Resume this action and shift its deadlines by the pause length.
+
+        Active actions are unchanged. For a suspended action, the stored
+        deadline is shifted and `on_resume(paused_for)` is called.
+
+        Args:
+            tick: Tick at which the action resumes.
+
+        Raises:
+            RuntimeError: If the action has not been admitted yet.
+        """
         match self._binding:
             case Bound(seq=seq, state=state):
                 match state:
@@ -186,11 +249,19 @@ class BaseAction[W](ABC):
                 raise RuntimeError("an unbound action cannot be resumed")
 
     def on_resume(self, paused_for: int, /) -> None:  # noqa: B027 - optional hook
-        """Override to shift game-owned deadlines by the same pause length."""
+        """React to resumption after `paused_for` logical ticks.
+
+        Override this hook to shift game-owned deadlines such as `arrives_at`.
+        The default implementation does nothing.
+        """
 
     @abstractmethod
     def process(self, ctx: TickContext[W], /) -> None:
-        """Say what should happen by telling the collecting `ctx`."""
+        """Describe this occurrence through the collecting context.
+
+        Mutate neither the queue nor persistent world state directly. Use the
+        context to stage effects, schedules, suspension, logs, and completion.
+        """
         ...
 
 

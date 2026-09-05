@@ -1,9 +1,7 @@
-"""Addressable deterministic randomness (§9).
+"""Addressable deterministic randomness.
 
-A global stream would couple unrelated entities through a hidden cursor: with
-one shared generator, whether Ivan's blow lands depends on whether Petra's
-fight -- a thousand miles away -- was processed first (§9.2). That coupling
-appears in no table, survives no restart, and forbids reordering the queue.
+Each action occurrence receives its own reproducible stream. Unrelated actions
+therefore cannot change one another's rolls merely by running first.
 """
 
 from hashlib import blake2b
@@ -27,15 +25,11 @@ _EVENT_PERSONALIZATION = b"foliot-event-v1"
 
 
 class Rng(Protocol):
-    """A stream already bound to `(world_seed, entity_id, tick, seq)`.
+    """A deterministic stream supplied to one decision.
 
-    Handlers never seed anything and never import `random`. Each draw advances
-    only a local counter, so every value stays addressable: "Ivan's third roll
-    in tick 5000" can be recomputed a year later without replaying anything.
-
-    Implementations must hash stably -- never `hash()` on a `str`, which
-    `PYTHONHASHSEED` salts per process and which therefore breaks replay across
-    a restart in a way that looks like a rare, mysterious bug (§9.4).
+    Action streams are bound to `(world_seed, entity_id, tick, seq)`. Consumers
+    normally receive an `Rng` through `TickContext` or an Event context rather
+    than constructing it directly.
     """
 
     def random(self) -> float:
@@ -43,15 +37,26 @@ class Rng(Protocol):
         ...
 
     def below(self, n: int, /) -> int:
-        """Uniform integer in `[0, n)` for `1 <= n <= 2**64`."""
+        """Return an unbiased integer in ``range(n)``.
+
+        Args:
+            n: Exclusive upper bound. Must satisfy ``1 <= n <= 2**64``.
+
+        Raises:
+            TypeError: If `n` is not an integer or is a boolean.
+            ValueError: If `n` is outside the supported range.
+        """
         ...
 
 
 def new_world_seed() -> int:
     """Return a securely generated unsigned 128-bit world seed.
 
-    The game calls this explicitly when creating a world and persists the
-    result. It is never called automatically or as an import side effect.
+    Call this once when creating a production world and persist the result.
+    It is never called automatically or as an import side effect.
+
+    Returns:
+        An integer satisfying ``0 <= seed < 2**128``.
     """
     return randbits(128)
 
@@ -63,7 +68,21 @@ def counter_rng(
     seq: int,
     /,
 ) -> Rng:
-    """Create the deterministic stream for one action occurrence."""
+    """Create the deterministic stream for one action occurrence.
+
+    Args:
+        world_seed: Persisted unsigned 128-bit seed for the world.
+        entity_id: Owner of the action.
+        tick: Logical tick being processed.
+        seq: Permanent sequence number assigned when the action was admitted.
+
+    Returns:
+        A fresh stream positioned before its first draw.
+
+    Raises:
+        TypeError: If `world_seed` is not an integer or is a boolean.
+        ValueError: If `world_seed` is outside the unsigned 128-bit range.
+    """
     _validate_world_seed(world_seed)
     stream_seed = _stream_seed(world_seed, entity_id, tick, seq)
     return _CounterRng(stream_seed)

@@ -1,4 +1,4 @@
-"""The deterministic tick loop (§7.4, §8, §10).
+"""The deterministic tick loop.
 
 Handlers only describe work in private collecting contexts. The engine asks
 every due action first, resolves any complete optional Events, then applies the
@@ -167,7 +167,17 @@ class _FinalizationContext[W]:
 
 
 class Simulation[W]:
-    """Advance one world through atomic, deterministic ticks."""
+    """Advance one world through atomic, deterministic ticks.
+
+    Args:
+        store: Consumer-supplied persistence adapter for world type `W`.
+        events: Optional Event collaborator using the exact same store.
+        finalizer: Optional game policy run after normal effects and before
+            commit.
+
+    Raises:
+        ValueError: If `events` is connected to a different store.
+    """
 
     __slots__ = ("_events", "_finalizer", "_store")
 
@@ -191,7 +201,12 @@ class Simulation[W]:
         return self._store.current_tick()
 
     def process_tick(self) -> None:
-        """Process and commit exactly one tick without waiting."""
+        """Process and commit exactly one tick without waiting.
+
+        Handler and resolver failures are logged and isolated before writes.
+        Exceptions raised while applying effects or finalization escape and
+        cause the store transaction to roll back.
+        """
         tick = self.tick
         with self._store.tick_transaction(tick) as txn:
             contexts = self._process_actions(tick)
@@ -260,7 +275,11 @@ class Simulation[W]:
         return contexts
 
     def run(self, driver: Driver, /) -> None:
-        """Process ticks while the injected driver permits."""
+        """Process ticks while `driver` permits and provides pacing.
+
+        Args:
+            driver: Manual, real-time, or consumer-defined pacing strategy.
+        """
         while driver.should_continue(self.tick):
             driver.wait_for(self.tick)
             self.process_tick()

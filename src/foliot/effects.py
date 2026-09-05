@@ -1,9 +1,4 @@
-"""Game-defined mutations of the world.
-
-The engine calls `apply` and knows nothing else -- not hp, not entity_state,
-not amount. A richer signature would put a game noun in the library, which is
-the line §3 draws.
-"""
+"""Structural contract for game-defined world mutations."""
 
 from typing import Protocol
 
@@ -19,11 +14,13 @@ class Effect[W](Protocol):
     starts deciding outcomes again.
 
     It receives the world reached through the tick's own transaction
-    (`Txn.world`), so its write lands in the same transaction as the queue by
-    construction rather than by the game wiring it correctly (§8.4).
+    (`Txn.world`), allowing a durable adapter to make world and queue writes
+    atomic.
 
     An action may be its own effect -- `ctx.emit(self)` -- when what it does and
     what happens are the same thing. Nothing here requires a separate class.
     """
 
-    def apply(self, world: W, /) -> None: ...
+    def apply(self, world: W, /) -> None:
+        """Apply this mutation to the transaction's game-owned world."""
+        ...
