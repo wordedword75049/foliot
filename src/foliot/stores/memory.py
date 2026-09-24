@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from threading import RLock
 from types import TracebackType
 
 from foliot.actions import (
@@ -20,6 +21,7 @@ from foliot.actions import (
     Unbound,
     restore_action_binding,
 )
+from foliot.admission import ActionAdmission, StaleSubmissionError
 from foliot.ids import EntityId, SuspensionId, Tick
 
 __all__ = ["MemoryStore"]
@@ -74,6 +76,7 @@ class _MemoryState[W]:
     scheduled: dict[Tick, dict[int, BaseAction[W]]] = field(default_factory=dict)
     recurring: dict[int, BaseAction[W]] = field(default_factory=dict)
     logs: list[tuple[Tick, str]] = field(default_factory=list)
+    lock: RLock = field(default_factory=RLock, repr=False)
     transaction_open: bool = False
 
 
@@ -151,20 +154,70 @@ class MemoryStore[W]:
     @property
     def logs(self) -> tuple[tuple[Tick, str], ...]:
         """Committed journal lines in insertion order."""
-        return tuple(self._state.logs)
+        with self._state.lock:
+            return tuple(self._state.logs)
 
     def current_tick(self) -> Tick:
-        return self._state.current_tick
+        with self._state.lock:
+            return self._state.current_tick
 
     def due(self, tick: Tick, /) -> tuple[BaseAction[W], ...]:
         """Return active recurring, due, and overdue actions in `seq` order."""
         _validate_tick(tick, name="tick")
-        actions = list(self._state.recurring.values())
-        for due_tick, bucket in self._state.scheduled.items():
-            if due_tick <= tick:
-                actions.extend(bucket.values())
-        actions.sort(key=lambda action: action.seq)
-        return tuple(actions)
+        with self._state.lock:
+            actions = list(self._state.recurring.values())
+            for due_tick, bucket in self._state.scheduled.items():
+                if due_tick <= tick:
+                    actions.extend(bucket.values())
+            actions.sort(key=lambda action: action.seq)
+            return tuple(actions)
+
+    def admit(
+        self,
+        action: BaseAction[W],
+        due_tick: Tick | None,
+        /,
+        *,
+        expected_tick: Tick,
+    ) -> ActionAdmission:
+        """Atomically bind and queue a new action at the observed boundary."""
+        _validate_tick(expected_tick, name="expected_tick")
+        if due_tick is not None:
+            _validate_tick(due_tick, name="due_tick")
+
+        state = self._state
+        with state.lock:
+            if state.transaction_open:
+                raise RuntimeError("cannot admit an action inside another store transaction")
+            if state.current_tick != expected_tick:
+                raise StaleSubmissionError(expected_tick, state.current_tick)
+            if not isinstance(action.binding, Unbound):
+                raise RuntimeError("an admitted action must be unbound")
+            if due_tick is not None and due_tick < expected_tick:
+                raise ValueError("due_tick must be at or after expected_tick")
+
+            seq = state.next_seq
+            binding_before = action.binding
+            state.transaction_open = True
+            try:
+                _apply_schedule(state, action, due_tick, seq)
+                state.next_seq = seq + 1
+                return ActionAdmission(seq, expected_tick)
+            except BaseException:
+                state.actions.pop(seq, None)
+                if due_tick is None:
+                    state.recurring.pop(seq, None)
+                else:
+                    bucket = state.scheduled.get(due_tick)
+                    if bucket is not None:
+                        bucket.pop(seq, None)
+                        if not bucket:
+                            del state.scheduled[due_tick]
+                state.next_seq = seq
+                restore_action_binding(action, binding_before)
+                raise
+            finally:
+                state.transaction_open = False
 
     def tick_transaction(self, tick: Tick, /) -> _MemoryTransactionContext[W]:
         """Open the one transaction allowed for the store's current tick.
@@ -295,18 +348,24 @@ class _MemoryTransactionContext[W]:
     def __enter__(self) -> _MemoryTxn[W]:
         if self._entered:
             raise RuntimeError("a memory transaction context cannot be entered twice")
-        if self._state.transaction_open:
-            raise RuntimeError("MemoryStore allows only one open transaction")
-        if self._tick != self._state.current_tick:
-            raise ValueError(
-                f"transaction tick {self._tick} does not match "
-                f"current tick {self._state.current_tick}"
-            )
+        self._state.lock.acquire()
+        try:
+            if self._state.transaction_open:
+                raise RuntimeError("MemoryStore allows only one open transaction")
+            if self._tick != self._state.current_tick:
+                raise ValueError(
+                    f"transaction tick {self._tick} does not match "
+                    f"current tick {self._state.current_tick}"
+                )
 
-        self._entered = True
-        self._state.transaction_open = True
-        self._txn = _MemoryTxn(self._state, self._tick)
-        return self._txn
+            txn = _MemoryTxn(self._state, self._tick)
+            self._entered = True
+            self._state.transaction_open = True
+            self._txn = txn
+            return txn
+        except BaseException:
+            self._state.lock.release()
+            raise
 
     def __exit__(
         self,
@@ -325,6 +384,7 @@ class _MemoryTransactionContext[W]:
         finally:
             txn.close()
             self._state.transaction_open = False
+            self._state.lock.release()
         return False
 
 

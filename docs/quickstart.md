@@ -74,8 +74,9 @@ from foliot import ManualDriver, MemoryStore, Simulation
 world = World(food=20)
 eat = Eat(EntityId("lira"))
 store = MemoryStore(world, world_seed=1, initial_actions=((eat, None),))
+simulation = Simulation(store)
 
-Simulation(store).run(ManualDriver(until_tick=9))
+simulation.run(ManualDriver(until_tick=9))
 
 assert world.food == 10
 assert store.current_tick() == 10
@@ -84,6 +85,27 @@ assert store.current_tick() == 10
 The target tick is inclusive: ticks 0 through 9 are ten ticks. `None` made the
 action recurring. A concrete integer would make it scheduled for that logical
 tick instead.
+
+## Admit an action between ticks
+
+The application can pause advancement, make a decision from its own world
+state, and add a new action to the live simulation:
+
+```python
+observed_tick = simulation.tick  # 10, the next unfinished tick
+visitor_eats = Eat(EntityId("visitor"))
+receipt = simulation.submit(visitor_eats, observed_tick, expected_tick=observed_tick)
+
+assert receipt.seq == visitor_eats.seq
+assert receipt.boundary_tick == 10
+
+simulation.process_tick()
+assert world.food == 8  # recurring Eat and the visitor's one-shot Eat ran
+```
+
+If another tick finishes after the application observes `observed_tick`,
+`submit()` raises `StaleSubmissionError`. The application can then read the
+new state and decide again. The action remains unbound after rejection.
 
 ## Choose a production seed
 

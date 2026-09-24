@@ -9,8 +9,9 @@ in their own shared action base.
 
 ## Admission and identity
 
-A newly constructed action has `Unbound()` as its complete binding. The first
-successful `Txn.schedule(...)` changes it to `Bound(seq, Active(due_tick))`.
+A newly constructed action has `Unbound()` as its complete binding. Its first
+successful `Txn.schedule(...)` inside a tick or `Simulation.submit(...)`
+between ticks changes it to `Bound(seq, Active(due_tick))`.
 
 `seq` is permanent. Rescheduling, suspending, and resuming replace the state
 without changing the sequence number. A durable adapter must persist and
@@ -21,6 +22,22 @@ restore both the binding and every application-defined subclass field.
 - `due_tick=50` means the action becomes due at logical tick 50.
 - `due_tick=None` means the action is due on every tick.
 - A deadline must be strictly later than the tick that schedules it.
+
+That last restriction applies to scheduling *inside* a tick. An external
+submission may use the next unfinished tick itself:
+
+```python
+observed_tick = simulation.tick
+receipt = simulation.submit(new_action, observed_tick, expected_tick=observed_tick)
+
+assert new_action.seq == receipt.seq
+assert receipt.boundary_tick == observed_tick
+```
+
+Submission requires an unbound action. It does not process or advance a tick.
+Pass the boundary from which the decision was made as `expected_tick`. If the
+world advanced before admission, Foliot raises `StaleSubmissionError` and
+leaves the action unbound. `due_tick=None` retains the recurring meaning.
 
 A scheduled action disappears after it runs unless it reschedules itself. A
 recurring action remains until it calls `ctx.finish()`.

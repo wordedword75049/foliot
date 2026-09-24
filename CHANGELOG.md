@@ -7,8 +7,18 @@ and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-24
+
+### Added
+
+- `Simulation.submit()` and `Store.admit()` for atomic external action
+  admission at an explicitly observed tick boundary.
+- `ActionAdmission` receipts and `StaleSubmissionError` for stale decisions.
+
 ### Changed
 
+- `Store` now requires `admit`; custom adapters must implement the new
+  transaction and locking contract before using 0.2.0.
 - Broadened the public positioning from game-oriented language to
   domain-agnostic persistent simulations.
 
@@ -30,5 +40,6 @@ and releases use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   continuation and ending.
 - Runnable Layer-1 Tinyworld and Layer-2 Eventworld examples.
 
-[Unreleased]: https://github.com/wordedword75049/foliot/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/wordedword75049/foliot/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wordedword75049/foliot/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wordedword75049/foliot/releases/tag/v0.1.0

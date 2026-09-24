@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
+from threading import RLock
 from types import TracebackType
 
 from foliot.actions import BaseAction
+from foliot.admission import ActionAdmission
 from foliot.events._api import (
     BaseEvent,
     EventAction,
@@ -40,7 +42,7 @@ class EventMemoryStore[W]:
         effects.
     """
 
-    __slots__ = ("_events", "_store")
+    __slots__ = ("_events", "_lock", "_store")
 
     def __init__(
         self,
@@ -57,6 +59,7 @@ class EventMemoryStore[W]:
             initial_actions=initial_actions,
         )
         self._events: dict[EventId, BaseEvent[W]] = {}
+        self._lock = RLock()
 
     @property
     def world_seed(self) -> int:
@@ -66,27 +69,44 @@ class EventMemoryStore[W]:
     @property
     def logs(self) -> tuple[tuple[Tick, str], ...]:
         """Committed deterministic journal entries in insertion order."""
-        return self._store.logs
+        with self._lock:
+            return self._store.logs
 
     def current_tick(self) -> Tick:
         """Return the next unfinished logical tick."""
-        return self._store.current_tick()
+        with self._lock:
+            return self._store.current_tick()
 
     def due(self, tick: Tick, /) -> tuple[BaseAction[W], ...]:
         """Return bound actions due at or before `tick`, plus recurring work."""
-        return self._store.due(tick)
+        with self._lock:
+            return self._store.due(tick)
+
+    def admit(
+        self,
+        action: BaseAction[W],
+        due_tick: Tick | None,
+        /,
+        *,
+        expected_tick: Tick,
+    ) -> ActionAdmission:
+        """Admit an ordinary action through the underlying memory store."""
+        with self._lock:
+            return self._store.admit(action, due_tick, expected_tick=expected_tick)
 
     def event(self, event_id: EventId, /) -> BaseEvent[W] | None:
         """Return the open Event with `event_id`, or `None`."""
-        return self._events.get(event_id)
+        with self._lock:
+            return self._events.get(event_id)
 
     def event_snapshot(self) -> dict[EventId, BaseEvent[W]]:
         """Return transaction-local Event references for the adapter itself."""
-        return self._events.copy()
+        with self._lock:
+            return self._events.copy()
 
     def tick_transaction(self, tick: Tick, /) -> AbstractContextManager[Txn[W]]:
         """Open an atomic in-memory boundary for one logical tick."""
-        return _EventMemoryTransactionContext(self, self._store.tick_transaction(tick))
+        return _EventMemoryTransactionContext(self, self._store.tick_transaction(tick), self._lock)
 
     def publish_events(
         self,
@@ -180,27 +200,42 @@ class _EventMemoryTxn[W]:
 
 
 class _EventMemoryTransactionContext[W]:
-    __slots__ = ("_entered", "_inner_context", "_store", "_txn")
+    __slots__ = ("_entered", "_inner_context", "_lock", "_store", "_txn")
 
     def __init__(
         self,
         store: EventMemoryStore[W],
         inner_context: AbstractContextManager[Txn[W]],
+        lock: RLock,
     ) -> None:
         self._store = store
         self._inner_context = inner_context
+        self._lock = lock
         self._txn: _EventMemoryTxn[W] | None = None
         self._entered = False
 
     def __enter__(self) -> _EventMemoryTxn[W]:
         if self._entered:
             raise RuntimeError("an Event memory transaction cannot be entered twice")
-        self._entered = True
-        self._txn = _EventMemoryTxn(
-            self._inner_context.__enter__(),
-            self._store.event_snapshot(),
-        )
-        return self._txn
+        self._lock.acquire()
+        inner_entered = False
+        try:
+            inner = self._inner_context.__enter__()
+            inner_entered = True
+            txn = _EventMemoryTxn(
+                inner,
+                self._store.event_snapshot(),
+            )
+            self._entered = True
+            self._txn = txn
+            return txn
+        except BaseException as error:
+            try:
+                if inner_entered:
+                    self._inner_context.__exit__(type(error), error, error.__traceback__)
+            finally:
+                self._lock.release()
+            raise
 
     def __exit__(
         self,
@@ -212,7 +247,10 @@ class _EventMemoryTransactionContext[W]:
         if txn is None:
             raise RuntimeError("the Event memory transaction was not entered")
 
-        handled = self._inner_context.__exit__(exc_type, exc_value, traceback)
-        if exc_type is None:
-            self._store.publish_events(txn.projected_events, txn.projected_children)
-        return handled is True
+        try:
+            handled = self._inner_context.__exit__(exc_type, exc_value, traceback)
+            if exc_type is None:
+                self._store.publish_events(txn.projected_events, txn.projected_children)
+            return handled is True
+        finally:
+            self._lock.release()

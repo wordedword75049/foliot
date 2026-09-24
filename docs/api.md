@@ -11,6 +11,7 @@ Import these names directly from `foliot`:
   `Active`, and `Suspended`.
 - **Processing:** `TickContext`, `Effect`, `Simulation`, `TickFinalizer`, and
   `FinalizationContext`.
+- **External admission:** `ActionAdmission` and `StaleSubmissionError`.
 - **Time:** `Driver`, `ManualDriver`, and `RealtimeDriver`.
 - **Storage:** `Store`, `Txn`, and `MemoryStore`.
 - **Randomness:** `Rng`, `counter_rng`, and `new_world_seed`.
@@ -18,6 +19,8 @@ Import these names directly from `foliot`:
 
 `BaseAction` is the one mandatory base class. The remaining action-state
 classes are useful when a store adapter serializes or inspects queue state.
+`Simulation.submit()` admits an unbound action at an explicitly observed tick
+boundary and returns a receipt with its permanent sequence and accepted tick.
 
 ## Optional Events
 
