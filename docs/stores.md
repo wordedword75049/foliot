@@ -7,7 +7,7 @@ The included `MemoryStore` is ideal for tests and examples, but it disappears
 when the process exits. A real application implements the structural `Store`
 and `Txn` protocols without inheriting from a foliot base class.
 
-## Store: reads and transaction creation
+## Store: reads and transaction boundaries
 
 ```python
 class Store[W](Protocol):
@@ -16,6 +16,14 @@ class Store[W](Protocol):
 
     def current_tick(self) -> int: ...
     def due(self, tick: int) -> Iterable[BaseAction[W]]: ...
+    def admit(
+        self,
+        action: BaseAction[W],
+        due_tick: int | None,
+        /,
+        *,
+        expected_tick: int,
+    ) -> ActionAdmission: ...
     def tick_transaction(self, tick: int) -> AbstractContextManager[Txn[W]]: ...
 ```
 
@@ -23,12 +31,38 @@ class Store[W](Protocol):
 - `current_tick()` returns the next unfinished logical tick.
 - `due(tick)` returns every active action whose deadline is at or before the
   tick, plus every recurring action whose deadline is `None`.
+- `admit(action, due_tick, expected_tick=...)` atomically binds one external
+  action and queues it without advancing the clock. `expected_tick` is the
+  boundary from which the application decided to submit it.
 - `tick_transaction(tick)` opens the single transaction in which that tick is
   applied.
 
 Every returned action is already bound. Its permanent `seq` is restored from
 storage. Result order does not affect correctness, although stable sequence
 order is convenient.
+
+## Admission between ticks
+
+The action passed to `admit` must be unbound. On success, it becomes
+`Bound(receipt.seq, Active(due_tick))` and the returned `ActionAdmission` holds
+that permanent `seq` and the accepted `boundary_tick`. A concrete `due_tick`
+may equal or exceed `expected_tick`; `None` makes the action recurring. Unlike
+`Txn.schedule`, admission may be due at the current boundary.
+
+The store must reject an observed boundary that differs from its actual
+`current_tick()` with `StaleSubmissionError(expected_tick, actual_tick)`. It
+must leave the action unbound, consume no sequence number, and make no queue
+change. It also rejects an already-bound action and a concrete deadline before
+the current boundary. Keep the tick comparison, sequence allocation, action
+write, and queue write in one atomic operation.
+
+Admission and tick processing need the same exclusive per-world lock. If
+admission acquires it first, the next tick sees the new action. If a tick
+commits first, admission sees the new tick and raises `StaleSubmissionError`.
+If that tick rolls back, admission may still succeed at the observed boundary.
+Calling `admit` reentrantly from inside a tick must raise instead of waiting
+on its own lock. Applications should use `ctx.schedule()` inside action
+processing.
 
 ## Txn: writes valid inside one tick
 
@@ -52,6 +86,16 @@ looks like this:
 
 ```python
 class PostgresStore:
+    def admit(self, action, due_tick, /, *, expected_tick):
+        # BEGIN; lock the same world row that tick_transaction locks.
+        # Read current_tick and next_seq under that lock.
+        # Raise StaleSubmissionError before any write if the tick changed.
+        # Insert the action and its queue state with next_seq.
+        # Bind the supplied action, advance next_seq, and COMMIT.
+        # Restore Unbound and ROLLBACK on a known failure.
+        # Return ActionAdmission(seq, current_tick) after commit.
+        ...
+
     def tick_transaction(self, tick: int):
         return PostgresTickTransaction(self.pool, tick)
 
@@ -60,25 +104,43 @@ class PostgresTickTransaction:
     def __enter__(self):
         self.connection = self.pool.acquire()
         self.connection.execute("BEGIN")
+        self.connection.execute(
+            "SELECT current_tick FROM worlds WHERE id = %s FOR UPDATE",
+            (self.world_id,),
+        )
+        # Verify the locked current_tick equals self.tick before reading due work.
         self.txn = PostgresTxn(self.connection, self.tick)
         return self.txn
 
     def __exit__(self, error_type, error, traceback):
-        if error_type is None:
-            self.txn.flush_batches()
-            self.connection.execute(
-                "UPDATE worlds SET current_tick = current_tick + 1 WHERE id = %s",
-                (self.world_id,),
-            )
-            self.connection.execute("COMMIT")
-        else:
+        try:
+            if error_type is not None:
+                self.connection.execute("ROLLBACK")
+            else:
+                self.txn.flush_batches()
+                self.connection.execute(
+                    "UPDATE worlds SET current_tick = current_tick + 1 WHERE id = %s",
+                    (self.world_id,),
+                )
+                self.connection.execute("COMMIT")
+        except BaseException:
             self.connection.execute("ROLLBACK")
+            raise
+        finally:
+            self.pool.release(self.connection)
 ```
 
 This is illustrative pseudocode, not a required database API. In practice,
 `Txn.world` can be an application repository or unit-of-work object bound to that same
 connection, allowing `effect.apply(txn.world)` to write through the active
 transaction.
+
+The adapter must restore the supplied Python action to `Unbound()` if an
+admission fails after binding it. A reported success follows the database
+commit. A crash after commit but before a caller receives the receipt can
+leave the caller uncertain whether its request succeeded; applications that
+need transport-level deduplication should manage that in their own persistence
+layer.
 
 ## Batch writes
 
@@ -134,7 +196,9 @@ commit through the same physical transaction.
 Foliot intentionally supports one active simulation runner per world. A
 production deployment should enforce that ownership with its process model,
 database advisory lock, lease, or another application-level mechanism. The
-library does not coordinate concurrent tick workers.
+library does not coordinate concurrent tick workers. External admission may
+arrive concurrently, but the adapter must serialize it with that runner's tick
+transaction using the same per-world lock.
 
 ## Adapter tests that matter
 
@@ -145,4 +209,17 @@ A durable adapter should prove:
 - permanent sequence numbers survive hydration and rescheduling;
 - suspension and deadline shifting survive restart;
 - owner-wide deletion catches newly scheduled work in the same transaction;
-- Event state and queue state cannot commit separately.
+- Event state and queue state cannot commit separately;
+- external admission survives restart without advancing the tick;
+- stale admission and injected failures leave the action unbound, consume no
+  sequence, and write no queue row;
+- concurrent admissions receive distinct sequences in commit order;
+- a submission waiting on a committed tick becomes stale, while one waiting
+  on a rolled-back tick may succeed;
+- reentrant admission inside a tick fails without deadlock.
+
+Adding `admit` to the structural `Store` protocol in 0.2.0 requires existing
+custom adapters to implement it. Tick processing may still work at runtime
+without the method, but such an adapter no longer satisfies the public
+protocol and `Simulation.submit()` cannot work with it. There is no safe
+fallback through `tick_transaction`, because that transaction advances time.

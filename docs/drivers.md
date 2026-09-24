@@ -3,6 +3,10 @@
 A `Driver` controls pacing. It never decides what a tick means and never
 changes the world.
 
+External inputs use `Simulation.submit(action, due_tick, expected_tick=...)`
+between advances. Drivers do not admit actions. The application may stop
+advancing while an external decision is pending, then submit and continue.
+
 ## ManualDriver
 
 `ManualDriver(until_tick=n)` processes immediately through `n`, inclusively.

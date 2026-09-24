@@ -53,6 +53,14 @@ A durable simulation must preserve:
 - the current logical tick;
 - every action's permanent `seq`, state, owner, and domain payload;
 - every open Event and its exact current children;
-- external inputs in deterministic order.
+- external inputs in deterministic admission order, including each action's
+  payload, due tick, and accepted boundary.
+
+Two concurrent submissions may arrive in either order. The store assigns
+permanent sequence numbers in its actual admission order. Replay must present
+the same ordered inputs at the same boundaries; it cannot recover their order
+from wall-clock timestamps or thread scheduling. `ActionAdmission` confirms
+the assigned sequence and boundary. A stale submission contributes no input to
+the replay history.
 
 Wall-clock time is not part of simulation state.

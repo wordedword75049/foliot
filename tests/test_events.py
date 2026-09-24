@@ -9,6 +9,7 @@ from typing import override
 import pytest
 
 from foliot import (
+    ActionAdmission,
     Active,
     BaseAction,
     Bound,
@@ -283,6 +284,16 @@ class ReverseEventStore:
 
     def due(self, tick: Tick, /) -> tuple[BaseAction[World], ...]:
         return tuple(reversed(self.inner.due(tick)))
+
+    def admit(
+        self,
+        action: BaseAction[World],
+        due_tick: Tick | None,
+        /,
+        *,
+        expected_tick: Tick,
+    ) -> ActionAdmission:
+        return self.inner.admit(action, due_tick, expected_tick=expected_tick)
 
     def event(self, event_id: EventId, /) -> BaseEvent[World] | None:
         return self.inner.event(event_id)

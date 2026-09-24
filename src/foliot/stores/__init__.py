@@ -4,11 +4,11 @@ foliot owns *when* to save; the application owns *how* and *where*. The library 
 no database and no dependency, but it does not leave the timing to the application,
 because the timing is the hard part and only the engine knows it.
 
-Two protocols, because reading is always legal and writing is not. The only way
-to obtain a `Txn` is to be inside a tick, so there is no write method anyone
-*could* call at the wrong moment: the rule becomes unsayable rather than
-remembered. Even an in-memory implementation stages foliot-owned changes until
-clean exit; a context manager is a transaction boundary, not decorative syntax.
+`Store.admit` is the one write allowed between ticks: it binds and queues an
+external action atomically without advancing the clock. `Txn` remains the
+write surface inside a tick. Even an in-memory implementation stages tick
+changes until clean exit; a context manager is a transaction boundary, not
+decorative syntax.
 """
 
 from collections.abc import Iterable
@@ -16,6 +16,7 @@ from contextlib import AbstractContextManager
 from typing import Protocol
 
 from foliot.actions import BaseAction
+from foliot.admission import ActionAdmission
 from foliot.ids import EntityId, SuspensionId, Tick
 from foliot.stores.memory import MemoryStore
 
@@ -82,14 +83,14 @@ class Txn[W](Protocol):
 
 
 class Store[W](Protocol):
-    """Reading, and opening a tick. The consumer's persistence adapter.
+    """Read state, admit external actions, and open ticks through an adapter.
 
     The engine never calls "save". It does its work inside a boundary the store
     defines, which is why this asks for a context manager rather than a `save()`
     method: Postgres uses `BEGIN`/`COMMIT`, while an in-memory implementation
     stages its own queue, log, binding, and clock changes until clean exit.
 
-    Two obligations that are contracts, not suggestions:
+    Three obligations that are contracts, not suggestions:
 
     - **A clean exit from `tick_transaction(n)` records tick n as finished**, so
       that `current_tick()` then returns `n + 1`. There is deliberately no
@@ -99,6 +100,9 @@ class Store[W](Protocol):
       snapshot.** The supported architecture has one active simulation runner
       per world; foliot does not promise to invalidate Python references that
       user code retained from an older snapshot.
+    - **`admit` and tick transactions serialize for the same world.** An
+      admitted action is visible to the following tick, or the admission sees
+      a changed boundary and raises `StaleSubmissionError` without writing.
     """
 
     @property
@@ -125,6 +129,31 @@ class Store[W](Protocol):
 
         Every returned action must be `Bound`. Order is not significant, and
         callers may process the result in any order.
+        """
+        ...
+
+    def admit(
+        self,
+        action: BaseAction[W],
+        due_tick: Tick | None,
+        /,
+        *,
+        expected_tick: Tick,
+    ) -> ActionAdmission:
+        """Atomically admit a new action without advancing the tick.
+
+        The action must be unbound. A concrete deadline may equal or exceed
+        `expected_tick`; `None` makes the action recurring. Admission and tick
+        transactions must serialize on the same world lock. On success the
+        action is bound to the receipt's permanent `seq`. Failure never changes
+        the supplied action's binding or consumes a sequence number.
+
+        Raises:
+            StaleSubmissionError: The next unfinished tick differs from
+                `expected_tick`. No part of the admission is committed.
+            ValueError: A concrete deadline is before the current boundary.
+            RuntimeError: The action is already bound or admission is called
+                reentrantly within another store transaction.
         """
         ...
 

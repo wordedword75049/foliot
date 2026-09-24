@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from foliot._event_bridge import EventConfigurationError
 from foliot.actions import Active, BaseAction, Suspended
+from foliot.admission import ActionAdmission
 from foliot.context import TickFinalizer
 from foliot.drivers import Driver
 from foliot.effects import Effect
@@ -199,6 +200,22 @@ class Simulation[W]:
     def tick(self) -> Tick:
         """The next unfinished tick."""
         return self._store.current_tick()
+
+    def submit(
+        self,
+        action: BaseAction[W],
+        due_tick: Tick | None,
+        /,
+        *,
+        expected_tick: Tick,
+    ) -> ActionAdmission:
+        """Admit an external action at an observed logical boundary.
+
+        `expected_tick` must come from the state used to choose the action.
+        The store rejects a stale choice instead of silently moving it to a
+        later tick. Submission does not process or advance a tick.
+        """
+        return self._store.admit(action, due_tick, expected_tick=expected_tick)
 
     def process_tick(self) -> None:
         """Process and commit exactly one tick without waiting.

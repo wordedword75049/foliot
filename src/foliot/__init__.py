@@ -25,6 +25,7 @@ from foliot.actions import (
     Suspended,
     Unbound,
 )
+from foliot.admission import ActionAdmission, StaleSubmissionError
 from foliot.context import FinalizationContext, TickContext, TickFinalizer
 from foliot.drivers import Driver, ManualDriver, RealtimeDriver
 from foliot.effects import Effect
@@ -34,6 +35,7 @@ from foliot.rng import Rng, counter_rng, new_world_seed
 from foliot.stores import MemoryStore, Store, Txn
 
 __all__ = [
+    "ActionAdmission",
     "ActionBinding",
     "ActionState",
     "Active",
@@ -48,6 +50,7 @@ __all__ = [
     "RealtimeDriver",
     "Rng",
     "Simulation",
+    "StaleSubmissionError",
     "Store",
     "Suspended",
     "SuspensionId",

@@ -7,6 +7,7 @@ from typing import override
 import pytest
 
 from foliot import (
+    ActionAdmission,
     Active,
     BaseAction,
     Bound,
@@ -183,6 +184,16 @@ class ReverseDueStore:
 
     def due(self, tick: Tick, /) -> Iterable[BaseAction[World]]:
         return reversed(self.inner.due(tick))
+
+    def admit(
+        self,
+        action: BaseAction[World],
+        due_tick: Tick | None,
+        /,
+        *,
+        expected_tick: Tick,
+    ) -> ActionAdmission:
+        return self.inner.admit(action, due_tick, expected_tick=expected_tick)
 
     def tick_transaction(self, tick: Tick, /) -> AbstractContextManager[Txn[World]]:
         return self.inner.tick_transaction(tick)

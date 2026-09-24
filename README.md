@@ -4,11 +4,12 @@
 simulations.
 
 It gives you a durable action queue, scheduled and recurring work, reproducible
-randomness, suspension and resumption, atomic ticks, real-time pacing, and an
-optional layer for simultaneous multi-entity events. It deliberately does not
-define a domain model or its rules. Applications can use it for games,
-agent-based models, virtual worlds, economies, ecosystems, logistics, and
-other stateful simulations while owning all domain state and behavior.
+randomness, external action admission, suspension and resumption, atomic ticks,
+real-time pacing, and an optional layer for simultaneous multi-entity events.
+It deliberately does not define a domain model or its rules. Applications can
+use it for games, agent-based models, virtual worlds, economies, ecosystems,
+logistics, and other stateful simulations while owning all domain state and
+behavior.
 
 > **Status:** pre-alpha. The core is tested and usable, but the public API may
 > still change before 1.0.
@@ -74,7 +75,8 @@ store = MemoryStore(
     initial_actions=((Hunger(EntityId("lira")), None),),
 )
 
-Simulation(store).run(ManualDriver(until_tick=9))
+simulation = Simulation(store)
+simulation.run(ManualDriver(until_tick=9))
 
 assert world.energy == 90
 assert len(store.logs) == 10
@@ -83,6 +85,20 @@ assert len(store.logs) == 10
 `due_tick=None` makes `Hunger` recurring, so it runs once per logical tick.
 Effects and journal lines are collected first and applied only after every due
 action has made its decision.
+
+You can also admit an action from outside tick processing. `expected_tick`
+names the state boundary from which the application made its decision:
+
+```python
+observed_tick = simulation.tick
+new_action = Hunger(EntityId("visitor"))
+receipt = simulation.submit(new_action, observed_tick, expected_tick=observed_tick)
+
+assert receipt.seq == new_action.seq
+```
+
+The submission does not advance time. If the world has advanced since
+`observed_tick`, it raises `StaleSubmissionError` without binding the action.
 
 ## The model
 
@@ -101,7 +117,7 @@ changes its deadline without changing that identity.
 
 Concrete deadlines must always be later than the current tick. An action due
 at tick 90 can reschedule itself for tick 100; it keeps the same sequence
-number.
+number. External submission may be due at the current unfinished tick.
 
 ## Optional simultaneous Events
 

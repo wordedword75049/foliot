@@ -17,6 +17,7 @@ Foliot owns:
 - deterministic random-stream derivation;
 - collection and deterministic application order;
 - the tick transaction boundary;
+- atomic external action admission between ticks;
 - optional simultaneous Event coordination;
 - manual and real-time pacing.
 
@@ -29,6 +30,7 @@ The application owns:
 - action and Event payload serialization;
 - database schema and domain repositories;
 - API and user-interface technology.
+- decisions about when and what external actions to submit.
 
 The practical test is simple: if the engine never needs to read a field, the
 field belongs to the application.
@@ -74,6 +76,11 @@ for tests and examples.
 The transaction is the correctness boundary. A completed tick must never leave
 world state, queue state, the journal, and `current_tick` disagreeing. Durable
 adapters are responsible for putting all four in one real database transaction.
+
+Between ticks, `Simulation.submit()` asks the Store to admit one unbound action
+atomically at an explicitly observed boundary. This operation uses the same
+per-world lock as tick processing, assigns the action's permanent sequence,
+and leaves the clock unchanged.
 
 ## Two layers
 
